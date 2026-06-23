@@ -53,6 +53,8 @@ export type RenderParams = {
   zoom: number;
   /** render the gradient as an ordered (Bayer) halftone dither */
   dither: boolean;
+  /** what fills the dithered cells: round dots, or hex chars from the SHAs */
+  ditherStyle: "dots" | "hex";
   /** dither cell size in px — smaller = finer */
   pixelSize: number;
   /** how much of the poster the data-driven dither covers (0..1) */
@@ -63,6 +65,12 @@ export type RenderParams = {
   tickCount: number;
   /** opacity of the tick marks */
   tickOpacity: number;
+  /** show the thin full-res flow lines across the whole field (off by default;
+   * release-converging lines still show regardless) */
+  filaments: boolean;
+  /** density of the data-block layer: random grid cells filled solid, sized +
+   * shaded by their churn, coloured by language zone (0 = off) */
+  blocks: number;
   wireframe: boolean;
 };
 
@@ -76,13 +84,16 @@ export function defaultParams(model: PosterModel): RenderParams {
     releasePull: 0.6,
     grain: 0.25,
     gridOpacity: 0,
-    zoom: 1.8,
+    zoom: 1,
     dither: true,
+    ditherStyle: "dots",
     pixelSize: 4,
     ditherCoverage: 0.1,
     sourceText: 0.22,
     tickCount: 26,
     tickOpacity: 0.32,
+    filaments: false,
+    blocks: 0.2,
     wireframe: false
   };
 }
@@ -125,12 +136,20 @@ export function renderPoster(
   const cells = buildCells(model, cols, rows);
   const wells = wellPositions(model, cols, rows);
 
+  // Build the flow strokes from a DEDICATED rng so they're identical in both
+  // wireframe and painted mode (independent of whatever else consumes the main
+  // rng first). This is what makes the wireframe match the painting's flow.
+  const strokeRng = makeRng((params.seed >>> 0) || 1);
+  const strokes = buildStrokes(ctx, model, params, cells, wells, strokeRng);
+
   paper(ctx);
 
   if (params.wireframe) {
+    // full, uncropped scaffolding — grid + axis stay aligned. The strokes come
+    // from strokeRng so they're the exact bones the painting is built on (the
+    // painted view is a zoomed crop of these same lines).
     if (params.sourceText > 0.001) textWallpaper(ctx, model, params, rng);
     grid(ctx, cols, rows, 0.5);
-    const strokes = buildStrokes(ctx, model, params, cells, wells, rng);
     drawWireLines(ctx, strokes);
     wellMarks(ctx, wells, 0.5);
     wireframeCells(ctx, cells);
@@ -139,16 +158,22 @@ export function renderPoster(
     return;
   }
 
-  const strokes = buildStrokes(ctx, model, params, cells, wells, rng);
   // smooth airbrush gradient base
   const field = sprayField(ctx, strokes, rng, params, model.seed);
+  // thin full-res flow lines layered over the base — only when enabled (off
+  // means off); release-converging lines get emphasised within the layer.
+  if (field && params.filaments) filamentPass(ctx, strokes, field, 1, rng, wells);
   // masked, feathered halftone dither — radiates from the release wells
   if (params.dither) ditherOverlay(ctx, field, params, model, wells, rng);
+  // scattered solid data-blocks (random cells, sized + shaded by their churn)
+  gridBlocks(ctx, model, params, rng);
   // layered on top: the faint commit-message + SHA wallpaper (source material)
   if (params.sourceText > 0.001) textWallpaper(ctx, model, params, rng);
   if (params.gridOpacity > 0.001) grid(ctx, cols, rows, params.gridOpacity);
   tickMarks(ctx, params, rng);
   timeMarkers(ctx, model, 0.3);
+  // release landmarks (rings + version labels) — the important moments, printed
+  if (field) releaseLandmarks(ctx, model, wells, field, 1);
   grain(ctx, params.grain); // film grain over everything
   vignette(ctx);
   cornerBlock(ctx, model);
@@ -159,6 +184,16 @@ export function renderToDataUrl(model: PosterModel, params: RenderParams, scale 
   const off = document.createElement("canvas");
   renderPoster(off, model, params, scale);
   return off.toDataURL("image/png");
+}
+
+// Renders the OG share image: just the poster itself at its native tall 3:4
+// (1200x1600), no card chrome or text. Uploaded by the client and served from
+// /og. JPEG (not PNG) because the poster's grain is near-incompressible as PNG
+// (multi-MB) but compresses to a couple hundred KB as JPEG.
+export function renderOgDataUrl(model: PosterModel, params: RenderParams): string {
+  const off = document.createElement("canvas");
+  renderPoster(off, model, params, 1); // 1200x1600
+  return off.toDataURL("image/jpeg", 0.85);
 }
 
 // ----------------------------------------------------------------- geometry
@@ -283,12 +318,23 @@ function walk(
   return pts;
 }
 
+// Each repo gets a distinct flow *character*, not just a phase offset, so two
+// repos with the same languages still look different. The seed sets the field's
+// wavelength (tight nervous curls vs broad lazy sweeps), a global rotation (the
+// direction the current runs), and how much turbulence rides on top.
 function curlField(x: number, y: number, seed: number): number {
   const s = (seed % 1000) * 0.001;
+  const fs = 0.55 + ((seed >>> 3) % 100) / 100 * 1.7; // 0.55..2.25 wavelength
+  const rot = ((seed >>> 7) % 360) * (Math.PI / 180); // current direction
+  const mix = 0.25 + ((seed >>> 11) % 100) / 100 * 0.7; // turbulence weight
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  const xr = x * cr - y * sr;
+  const yr = x * sr + y * cr;
   return (
-    Math.sin(x * 0.011 + s * 6.2) +
-    Math.cos(y * 0.013 + s * 9.1) +
-    0.5 * Math.sin((x + y) * 0.007 + s * 3.3)
+    Math.sin(xr * 0.011 * fs + s * 6.2) +
+    Math.cos(yr * 0.013 * fs + s * 9.1) +
+    mix * Math.sin((xr + yr) * 0.007 * fs + s * 3.3)
   );
 }
 
@@ -314,6 +360,21 @@ function gravityNudge(pos: Pt, ang: number, wells: Pt[], pull: number): number {
 // The smoothness trick: paint the colour field at LOW resolution, then upscale
 // with bilinear smoothing. Lumps become buttery large-scale gradients. Fine
 // grain is added separately so the result is "smooth but noisy" — the airbrush.
+// The zoom crop, shared by the painted field and the wireframe so both frame
+// the SAME sub-region. A 1.8x baseline is folded in so the slider's 1.0 already
+// reads as a close, calm crop; higher pushes further in. fx/fy (seeded) pick
+// which part of the field the crop lands on.
+function zoomCrop(
+  params: RenderParams,
+  seed: number
+): { z: number; fx: number; fy: number } {
+  return {
+    z: clamp(params.zoom, 1, 4) * 1.8,
+    fx: 0.3 + ((seed % 41) / 41) * 0.4,
+    fy: 0.3 + (((seed >> 5) % 37) / 37) * 0.4
+  };
+}
+
 function sprayField(
   ctx: CanvasRenderingContext2D,
   strokes: Stroke[],
@@ -321,7 +382,7 @@ function sprayField(
   params: RenderParams,
   seed: number
 ): Field {
-  const fw = 200; // field resolution (also sampled by the dither overlay)
+  const fw = 280; // field resolution (also sampled by the dither overlay)
   const fh = Math.round((fw * H) / W);
   const fc = document.createElement("canvas");
   fc.width = fw;
@@ -345,6 +406,9 @@ function sprayField(
   };
 
   const scaleR = fw / 92; // keep footprint constant across field resolutions
+  // BASE layer: large, faint soft dabs along each stroke that merge into the
+  // buttery airbrush masses (the soft cloud look). Thin flow detail can't live
+  // here — it would blur away on upscale — so it's drawn full-res afterwards.
   for (const stroke of strokes) {
     const sp = sprite(stroke.color);
     const n = stroke.pts.length;
@@ -361,12 +425,10 @@ function sprayField(
   }
   f.globalAlpha = 1;
 
-  // zoom: sample a sub-region of the field (close-up crop) for big calm masses
-  const z = clamp(params.zoom, 1, 4);
+  // zoom: sample a sub-region of the field (close-up crop) for big calm masses.
+  const { z, fx, fy } = zoomCrop(params, seed);
   const srcW = fw / z;
   const srcH = fh / z;
-  const fx = 0.3 + ((seed % 41) / 41) * 0.4;
-  const fy = 0.3 + (((seed >> 5) % 37) / 37) * 0.4;
   const srcX = (fw - srcW) * fx;
   const srcY = (fh - srcH) * fy;
 
@@ -389,6 +451,253 @@ type Field = {
   srcW: number;
   srcH: number;
 };
+
+// FILAMENT pass: thin, faint flow lines drawn at FULL canvas resolution on top
+// of the smooth airbrush base — a delicate version of the wireframe laid over
+// the painting, so the current running through the soft masses reads clearly.
+// Drawn full-res (not into the low-res field) so the lines don't blur away.
+// Mapped through the same zoom crop the base used, so they line up exactly.
+function filamentPass(
+  ctx: CanvasRenderingContext2D,
+  strokes: Stroke[],
+  field: Field,
+  strength: number,
+  rng: () => number,
+  wells: Pt[]
+): void {
+  const { fw, fh, srcX, srcY, srcW, srcH } = field;
+  const sx = fw / W;
+  const sy = fh / H;
+  const kx = W / srcW; // field px -> display px (folds in the zoom crop)
+  const ky = H / srcH;
+  const tx = (x: number) => (x * sx - srcX) * kx;
+  const ty = (y: number) => (y * sy - srcY) * ky;
+
+  // Only a sparse, randomly-chosen subset of strokes show as filaments, so they
+  // read as a scattered few flow lines rather than a dense net. Deterministic
+  // (seeded rng) so a poster always draws the same ones; reroll reshuffles them.
+  const SHOW = 0.18;
+  const NEAR = 200; // a filament tip within this of a release is "converging"
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const stroke of strokes) {
+    const n = stroke.pts.length;
+    if (n < 2) continue;
+    // does this filament run into a release? if so it always shows, brighter +
+    // thicker, so you see the current pulling into the important moments.
+    const tip = stroke.pts[n - 1];
+    let near = false;
+    for (const w of wells) {
+      if (Math.hypot(w.x - tip.x, w.y - tip.y) < NEAR) {
+        near = true;
+        break;
+      }
+    }
+    const lucky = rng() < SHOW;
+    const jitter = 0.6 + rng() * 0.8; // keep rng stream stable regardless of show
+    // a sparse subset shows as flow lines; release-converging ones always show
+    // (brighter + thicker) so the current pulling into releases reads.
+    if (!near && !lucky) continue;
+
+    const c = stroke.color;
+    const boost = near ? 2.1 : 1;
+    ctx.strokeStyle = `rgb(${c.r},${c.g},${c.b})`;
+    ctx.globalAlpha = clamp((0.05 + stroke.norm * 0.12) * jitter * strength * boost, 0, 0.6);
+    // super slim, only mildly thickened by churn, zoom, and convergence
+    ctx.lineWidth = clamp((0.28 + stroke.norm * 0.65) * Math.sqrt(kx) * (near ? 1.7 : 1), 0.35, 2.4);
+    ctx.beginPath();
+    ctx.moveTo(tx(stroke.pts[0].x), ty(stroke.pts[0].y));
+    for (let i = 1; i < n; i++) ctx.lineTo(tx(stroke.pts[i].x), ty(stroke.pts[i].y));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// Release landmarks: at each release tag, a faint concentric ring + center node
+// (echoing the wireframe's gravity rings) and a tiny version label — the repo's
+// important moments printed onto the finished poster as "source made visible".
+// Drawn full-res through the same zoom crop as the base so they sit exactly on
+// their wells; wells cropped out of the zoom view are skipped.
+function releaseLandmarks(
+  ctx: CanvasRenderingContext2D,
+  model: PosterModel,
+  wells: Pt[],
+  field: Field,
+  strength: number
+): void {
+  if (!wells.length) return;
+  const { fw, fh, srcX, srcY, srcW, srcH } = field;
+  const sx = fw / W;
+  const sy = fh / H;
+  const kx = W / srcW;
+  const ky = H / srcH;
+  const tx = (x: number) => (x * sx - srcX) * kx;
+  const ty = (y: number) => (y * sy - srcY) * ky;
+  const r = clamp(7 * Math.sqrt(kx), 9, 30);
+
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = `600 ${Math.round(clamp(8 * Math.sqrt(kx), 9, 15))}px "JetBrains Mono", ui-monospace, monospace`;
+  for (let i = 0; i < wells.length; i++) {
+    const dx = tx(wells[i].x);
+    const dy = ty(wells[i].y);
+    if (dx < GX0 - 30 || dx > GX1 + 30 || dy < GY0 - 30 || dy > GY1 + 30) continue;
+
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = `rgba(${RP_INK},${(0.38 * strength).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(dx, dy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(${RP_INK},${(0.18 * strength).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(dx, dy, r * 1.9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = `rgba(${RP_INK},${(0.8 * strength).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(dx, dy, 2.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    const label = model.wells[i]?.label?.slice(0, 12);
+    if (label) {
+      ctx.fillStyle = `rgba(${RP_INK},${(0.6 * strength).toFixed(3)})`;
+      ctx.fillText(label, dx + r + 5, dy);
+    }
+  }
+  ctx.restore();
+}
+
+// can an s x s block be placed with top-left at (cx,cy) — in bounds and on
+// only free cells of the SUB x SUB occupancy grid?
+function fitsBlock(occ: Uint8Array, SUB: number, cx: number, cy: number, s: number): boolean {
+  if (cx + s > SUB || cy + s > SUB) return false;
+  for (let dy = 0; dy < s; dy++)
+    for (let dx = 0; dx < s; dx++) if (occ[(cy + dy) * SUB + (cx + dx)]) return false;
+  return true;
+}
+
+// Data-block layer: each time/language grid cell becomes a little unit-chart
+// (waffle) of small squares. The NUMBER of filled squares ~ that period's churn
+// (busy weeks fill more of the cell, dead periods stay blank); within a cell the
+// squares split into lighter "additions" and darker "deletions" by the real
+// add/del ratio. Colour = language zone, position = true time grid (aligns with
+// the year axis + corner). Only WHICH squares fill is random (seeded).
+function gridBlocks(
+  ctx: CanvasRenderingContext2D,
+  model: PosterModel,
+  params: RenderParams,
+  rng: () => number
+): void {
+  const amount = clamp(params.blocks, 0, 1);
+  if (amount <= 0) return;
+  const cols = 8;
+  const rows = rowCount(model);
+  const cells = buildCells(model, cols, rows);
+  const maxChurn = Math.max(1, ...cells.map((c) => c.add + c.del));
+  const palette = buildPalette(model, rng);
+  const cellW = (GX1 - GX0) / cols;
+  const cellH = (GY1 - GY0) / rows;
+  const minSide = Math.min(cellW, cellH);
+  // subdivide each cell into a SUB x SUB grid of small squares (~9px each)
+  const SUB = clamp(Math.round(minSide / 9), 4, 12);
+  const maxFill = SUB * SUB;
+  const subW = cellW / SUB;
+  const subH = cellH / SUB;
+  const density = clamp(amount * 1.6, 0, 1);
+  const idxs = Array.from({ length: maxFill }, (_, i) => i);
+
+  // recompute the dither's mask threshold (same formula as ditherOverlay) so we
+  // can fade blocks out where the dither takes over — the two layers don't fight.
+  const ditherOn = params.dither;
+  const coverage = clamp(params.ditherCoverage, 0, 1);
+  const dataShift = (params.density - 1) * 0.14 + (params.volatility - 0.4) * 0.2;
+  const thr = clamp(0.66 - coverage * 0.52 - dataShift, 0.05, 0.93);
+
+  ctx.save();
+  for (const c of cells) {
+    const churn = c.add + c.del;
+    if (churn <= 0) continue; // genuinely no sampled activity -> stay blank
+    // LOG scale, not linear: a single huge spike shouldn't make every other
+    // active period look dead. And any period with real churn always gets a
+    // couple of squares, so "active but modest" never reads as "dead".
+    const norm = Math.log1p(churn) / Math.log1p(maxChurn);
+    const count = clamp(Math.round(norm * maxFill * density), 2, maxFill);
+
+    const lang = pickLang(palette, coherentNoise(c.cx, c.cy, model.seed));
+    const sh = lang.shades;
+    const last = sh.length - 1;
+    const addBudget = Math.round(count * (c.add / churn)); // build-vs-prune split
+
+    // Fisher–Yates shuffle so the placement order scatters within the cell
+    for (let i = maxFill - 1; i > 0; i--) {
+      const j = (rng() * (i + 1)) | 0;
+      const t = idxs[i];
+      idxs[i] = idxs[j];
+      idxs[j] = t;
+    }
+
+    const ox = GX0 + c.col * cellW;
+    const oy = GY0 + c.row * cellH;
+    const gap = subW * 0.17; // consistent gap around every block, any size
+    const gapH = subH * 0.17;
+    // busier cells may host bigger blocks (visual hierarchy by churn)
+    const maxSize = clamp(1 + Math.floor(norm * 3), 1, Math.min(4, SUB));
+
+    // greedy pack: drop mixed-size squares that tile without overlapping until
+    // we've covered ~`count` sub-cells (so total area still tracks the churn).
+    const occ = new Uint8Array(maxFill);
+    let covered = 0;
+    for (let p = 0; p < maxFill && covered < count; p++) {
+      const si = idxs[p];
+      if (occ[si]) continue;
+      const cxi = si % SUB;
+      const cyi = (si / SUB) | 0;
+
+      // pick a size, biased small, then shrink until it fits free space + bounds
+      let s = 1;
+      const r = rng();
+      if (maxSize >= 3 && r > 0.88) s = 3;
+      else if (maxSize >= 2 && r > 0.58) s = 2;
+      while (s > 1 && !fitsBlock(occ, SUB, cxi, cyi, s)) s--;
+      for (let dy = 0; dy < s; dy++)
+        for (let dx = 0; dx < s; dx++) occ[(cyi + dy) * SUB + (cxi + dx)] = 1;
+
+      // colour: adds from the lighter half of the ramp, dels from the darker —
+      // decided by how much we've covered vs the add budget. Varies per block.
+      const isAdd = covered < addBudget;
+      covered += s * s;
+      const f = isAdd ? 0.52 + rng() * 0.46 : 0.04 + rng() * 0.34;
+      const col = sh[clamp(Math.round(last * f), 0, last)];
+
+      const bx = ox + cxi * subW + gap;
+      const by = oy + cyi * subH + gapH;
+      const bwS = s * subW - gap * 2;
+      const bhS = s * subH - gapH * 2;
+
+      const mcx = bx + bwS / 2;
+      const mcy = by + bhS / 2;
+      // fade out where the dither mask is strong so the layers don't collide
+      let fade = 1;
+      if (ditherOn) {
+        const region = maskNoise(mcx, mcy, params.seed, params.volatility, params.flow);
+        fade = 1 - smoothstep(thr - 0.04, thr + 0.5, region) * 0.9;
+      }
+      // a second, independent organic mask -> scattered random fade-outs that
+      // break the blocks up into drifting islands (always on).
+      const m2 = maskNoise(mcx, mcy, (params.seed ^ 0x9e3779b9) >>> 0, params.volatility, params.flow);
+      fade *= 1 - smoothstep(0.3, 0.82, m2) * 0.96;
+      // wide per-block opacity, occasionally near-solid for pop
+      ctx.globalAlpha = clamp(0.22 + rng() * rng() * 1.0, 0.16, 0.92) * fade;
+      ctx.fillStyle = `rgb(${col.r},${col.g},${col.b})`;
+      ctx.fillRect(bx, by, bwS, bhS);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
 
 // 8x8 Bayer ordered-dither matrix, normalized to (0..1)
 const BAYER8 = [
@@ -420,10 +729,13 @@ function ditherOverlay(
   const { f, fw, fh, srcX, srcY, srcW, srcH } = field;
   const data = f.getImageData(0, 0, fw, fh).data;
   const seed = params.seed; // keyed to seed so reroll reshuffles the regions
+  const hex = params.ditherStyle === "hex";
   const P = clamp(params.pixelSize, 2, 16);
-  const cols = Math.ceil(W / P);
-  const rows = Math.ceil(H / P);
-  const dotR = Math.max(0.8, P * 0.46);
+  // hex glyphs need a bigger cell than dots to stay legible
+  const step = hex ? clamp(P * 2.4, 9, 26) : P;
+  const cols = Math.ceil(W / step);
+  const rows = Math.ceil(H / step);
+  const dotR = Math.max(0.8, step * 0.46);
   // dither area is data-driven: denser + more volatile repos bubble through
   // more of the poster; the slider is a manual master on top.
   const coverage = clamp(params.ditherCoverage, 0, 1);
@@ -432,11 +744,21 @@ function ditherOverlay(
   // release wells bloom extra dither around them (radius grows with coverage)
   const wellR = 150 + coverage * 220 + params.volatility * 110;
 
+  // the repo's commit hashes, streamed contiguously through the lit cells so the
+  // clusters read like a ledger of SHAs. Falls back to a seed-derived hex run.
+  const hexStream = (model.shas.join("") || seed.toString(16)).replace(/[^0-9a-f]/gi, "");
+  let hi = 0;
+
   ctx.save();
+  if (hex) {
+    ctx.font = `${Math.round(step * 1.02)}px "JetBrains Mono", ui-monospace, monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+  }
   for (let gy = 0; gy < rows; gy++) {
     for (let gx = 0; gx < cols; gx++) {
-      const ox = gx * P;
-      const oy = gy * P;
+      const ox = gx * step;
+      const oy = gy * step;
       const fxp = Math.min(fw - 1, Math.max(0, Math.floor(srcX + (ox / W) * srcW)));
       const fyp = Math.min(fh - 1, Math.max(0, Math.floor(srcY + (oy / H) * srcH)));
 
@@ -457,19 +779,25 @@ function ditherOverlay(
 
       ctx.globalAlpha = m;
       ctx.fillStyle = RP_PAPER;
-      ctx.fillRect(ox, oy, P + 0.6, P + 0.6);
+      ctx.fillRect(ox, oy, step + 0.6, step + 0.6);
 
       const dr = r - RP_PAPER_RGB.r;
       const dg = g - RP_PAPER_RGB.g;
       const db = b - RP_PAPER_RGB.b;
       const dist = Math.sqrt(dr * dr + dg * dg + db * db);
       const v = clamp(0.1 + Math.pow(dist / 175, 0.85) * 0.8, 0, 1);
-      // dots thin out progressively toward the edges -> soft, large feather
+      // cells thin out progressively toward the edges -> soft, large feather
       if (v > BAYER8[gy & 7][gx & 7] && rng() < m * m) {
         ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.beginPath();
-        ctx.arc(ox + P / 2, oy + P / 2, dotR, 0, Math.PI * 2);
-        ctx.fill();
+        if (hex) {
+          const ch = hexStream[hi % hexStream.length];
+          hi++;
+          ctx.fillText(ch, ox + step / 2, oy + step / 2);
+        } else {
+          ctx.beginPath();
+          ctx.arc(ox + step / 2, oy + step / 2, dotR, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
     }
   }
@@ -798,21 +1126,39 @@ function buildPalette(model: PosterModel, rng: () => number): LangPigment[] {
   const perLang = mono ? 8 : 6;
   const hueSpread = mono ? 54 : 30;
 
+  // Per-repo tonal signature: a bounded hue rotation + lightness bias so two
+  // repos sharing a dominant language still diverge in tone (one a cooler/lighter
+  // blue, another a deeper indigo). Greys are untouched (sFactor ~0 in shadesOf).
+  const sig = model.seed;
+  const hueShift = ((sig >>> 13) % 41) - 20; // -20..+20 deg
+  const lightBias = (((sig >>> 19) % 21) - 10) / 100; // -0.10..+0.10
+
   let acc = 0;
   return biased.map((e) => {
     acc += e.w / total;
-    return { upto: acc, shades: shadesOf(e.color, perLang, hueSpread, rng) };
+    return {
+      upto: acc,
+      shades: shadesOf(e.color, perLang, hueSpread, hueShift, lightBias, rng)
+    };
   });
 }
 
-function shadesOf(hex: string, count: number, hueSpread: number, rng: () => number): RGB[] {
+function shadesOf(
+  hex: string,
+  count: number,
+  hueSpread: number,
+  hueShift: number,
+  lightBias: number,
+  rng: () => number
+): RGB[] {
   const base = hexToHsl(hex);
   const out: RGB[] = [];
   const sFactor = Math.min(1, base.s * 2.5); // ~0 for greys -> stay neutral
   for (let i = 0; i < count; i++) {
     const f = count > 1 ? i / (count - 1) : 0.5; // 0 dark .. 1 light
-    const L = clamp(base.l + (f - 0.42) * 0.44, 0.05, 0.92);
-    const H = (base.h + ((f - 0.5) * hueSpread + (rng() - 0.5) * 12) * sFactor + 360) % 360;
+    const L = clamp(base.l + lightBias + (f - 0.42) * 0.44, 0.05, 0.92);
+    const H =
+      (base.h + (hueShift + (f - 0.5) * hueSpread + (rng() - 0.5) * 12) * sFactor + 360) % 360;
     const S = clamp(base.s * (0.55 + 0.55 * (1 - Math.abs(f - 0.5) * 1.4)), 0, 1);
     out.push(hslToRgb(H, S, L));
   }
@@ -828,10 +1174,11 @@ function pickLang(palette: LangPigment[], region: number): LangPigment {
 
 function coherentNoise(x: number, y: number, seed: number): number {
   const s = (seed % 1000) * 0.001;
+  const zs = 0.65 + ((seed >>> 17) % 100) / 100 * 1.0; // per-repo zone scale
   const v =
-    Math.sin(x * 0.0042 + s * 5) +
-    Math.cos(y * 0.0047 + s * 7) +
-    Math.sin((x * 0.003 - y * 0.0035) + s * 3);
+    Math.sin(x * 0.0042 * zs + s * 5) +
+    Math.cos(y * 0.0047 * zs + s * 7) +
+    Math.sin((x * 0.003 - y * 0.0035) * zs + s * 3);
   return clamp(v / 3 + 0.5, 0, 1);
 }
 

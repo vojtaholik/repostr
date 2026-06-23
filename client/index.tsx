@@ -8,7 +8,13 @@ import {
   type PosterModel,
   type RawRepo
 } from "../shared/poster";
-import { defaultParams, renderPoster, renderToDataUrl, type RenderParams } from "./render";
+import {
+  defaultParams,
+  renderOgDataUrl,
+  renderPoster,
+  renderToDataUrl,
+  type RenderParams
+} from "./render";
 
 // modern type: Space Grotesk for display/UI, JetBrains Mono for the mono chrome
 if (typeof document !== "undefined" && !document.getElementById("repostr-fonts")) {
@@ -68,6 +74,7 @@ export function App() {
     ],
     void
   >("recordPoster");
+  const ogDone = useRef<Set<string>>(new Set());
 
   const [input, setInput] = useState("");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -77,7 +84,7 @@ export function App() {
   const runToken = useRef(0);
   const rafRef = useRef(0);
 
-  async function paint(rawInput: string) {
+  async function paint(rawInput: string, urlParams?: URLSearchParams) {
     const parsed = parseRepoInput(rawInput);
     if (!parsed) {
       setPhase({ kind: "error", message: "Paste a GitHub repo URL — e.g. github.com/facebook/react." });
@@ -100,7 +107,9 @@ export function App() {
         return;
       }
       const model = analyze(data.repo as RawRepo);
-      setParams(defaultParams(model));
+      // a deep link carries the exact view (seed + slider edits); otherwise start
+      // from the repo's defaults.
+      setParams(urlParams ? paramsFromQuery(model, urlParams) : defaultParams(model));
       setPhase({ kind: "done", model });
       const top = model.palette[0];
       void recordPoster({
@@ -111,6 +120,30 @@ export function App() {
         languageColor: top?.color ?? "#8a8a8a",
         volatility: model.volatility
       });
+
+      // Warm the OG share card once per repo (default view = canonical image).
+      // Deferred + idle so the heavy offscreen render doesn't block first paint.
+      if (!ogDone.current.has(model.slug)) {
+        ogDone.current.add(model.slug);
+        const warm = () => {
+          try {
+            const dataUrl = renderOgDataUrl(model, defaultParams(model));
+            const b64 = dataUrl.split(",")[1] ?? "";
+            if (b64) {
+              void fetch(`og?repo=${encodeURIComponent(model.slug)}`, {
+                method: "POST",
+                body: b64
+              });
+            }
+          } catch {
+            /* OG is best-effort */
+          }
+        };
+        const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => void })
+          .requestIdleCallback;
+        if (ric) ric(warm);
+        else setTimeout(warm, 800);
+      }
     } catch {
       if (runToken.current !== token) return;
       setPhase({ kind: "error", message: "Network error reaching the server." });
@@ -128,10 +161,23 @@ export function App() {
   }, [phase, params, editorOpen]);
 
   useEffect(() => {
-    const repo = new URLSearchParams(window.location.search).get("repo");
-    if (repo) void paint(repo);
+    const sp = new URLSearchParams(window.location.search);
+    const repo = sp.get("repo");
+    if (repo) void paint(repo, sp);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // keep the address bar pointing at the exact current view, so "copy link"
+  // (and a plain reload) always reproduce what's on screen — seed, shuffle, and
+  // every slider edit included.
+  useEffect(() => {
+    if (phase.kind !== "done" || !params) return;
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}?${paramsQuery(phase.model, params)}`
+    );
+  }, [phase, params]);
 
   function set<K extends keyof RenderParams>(key: K, value: RenderParams[K]) {
     setParams((p) => (p ? { ...p, [key]: value } : p));
@@ -388,7 +434,7 @@ function ResultView({
       <div className="mt-7 flex flex-wrap items-center justify-center gap-2 font-mono text-[11px]">
         <Btn primary onClick={onShuffle}>shuffle</Btn>
         <Btn onClick={() => downloadPoster(model, params)}>download</Btn>
-        <Btn onClick={() => copyLink(model.slug)}>copy link</Btn>
+        <Btn onClick={() => copyLink(model, params)}>copy link</Btn>
         <Btn onClick={onEdit}>open editor</Btn>
         <Btn onClick={onReset}>new</Btn>
       </div>
@@ -435,7 +481,7 @@ function Editor({
         <div className="flex items-center gap-2">
           <Btn primary onClick={onShuffle}>shuffle</Btn>
           <Btn onClick={() => downloadPoster(model, params)}>download</Btn>
-          <Btn onClick={() => copyLink(model.slug)}>copy link</Btn>
+          <Btn onClick={() => copyLink(model, params)}>copy link</Btn>
           <Btn onClick={onReset}>new</Btn>
         </div>
       </header>
@@ -528,6 +574,13 @@ function Controls({
         <Slider label="spread" value={params.spread} min={0} max={1} step={0.02} onChange={(v) => set("spread", v)} />
         <Slider label="release pull" value={params.releasePull} min={0} max={1} step={0.02} onChange={(v) => set("releasePull", v)} />
         <Slider label="grain" value={params.grain} min={0} max={1} step={0.02} onChange={(v) => set("grain", v)} />
+        <Slider label="data blocks" value={params.blocks} min={0} max={1} step={0.02} onChange={(v) => set("blocks", v)} />
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-[11px] text-[#8f8f8f]">flow lines</span>
+          <Toggle on={params.filaments} onClick={() => set("filaments", !params.filaments)}>
+            {params.filaments ? "on" : "off"}
+          </Toggle>
+        </div>
       </div>
 
       <div className="mt-5 border-t border-[#1e1e1e] pt-4">
@@ -540,6 +593,15 @@ function Controls({
         <div className="space-y-2">
           {params.dither && (
             <>
+              <div className="flex items-center justify-between pb-1">
+                <span className="text-[11px] text-[#8f8f8f]">glyph</span>
+                <Toggle
+                  on={params.ditherStyle === "hex"}
+                  onClick={() => set("ditherStyle", params.ditherStyle === "hex" ? "dots" : "hex")}
+                >
+                  {params.ditherStyle === "hex" ? "hex" : "dots"}
+                </Toggle>
+              </div>
               <Slider label="pixel size" value={params.pixelSize} min={2} max={14} step={1} onChange={(v) => set("pixelSize", v)} fmt={(v) => String(v)} />
               <Slider label="dither area" value={params.ditherCoverage} min={0} max={1} step={0.02} onChange={(v) => set("ditherCoverage", v)} />
             </>
@@ -690,8 +752,68 @@ function downloadPoster(model: PosterModel, params: RenderParams) {
   a.remove();
 }
 
-function copyLink(slug: string) {
-  const url = `${window.location.origin}${window.location.pathname}?repo=${slug}`;
+// every tunable that defines a view; the URL encodes the slug plus any of these
+// that differ from the repo's defaults, so a link reproduces exactly what's on
+// screen (seed/shuffle + every slider edit).
+const PARAM_KEYS: (keyof RenderParams)[] = [
+  "seed",
+  "volatility",
+  "density",
+  "flow",
+  "spread",
+  "releasePull",
+  "grain",
+  "gridOpacity",
+  "zoom",
+  "dither",
+  "pixelSize",
+  "ditherCoverage",
+  "sourceText",
+  "tickCount",
+  "tickOpacity",
+  "filaments",
+  "blocks",
+  "ditherStyle",
+  "wireframe"
+];
+
+function paramsQuery(model: PosterModel, params: RenderParams): string {
+  const d = defaultParams(model);
+  const q = new URLSearchParams();
+  q.set("repo", model.slug);
+  for (const k of PARAM_KEYS) {
+    const v = params[k];
+    if (v === d[k]) continue; // only encode what differs from the default view
+    if (typeof v === "boolean") q.set(k, v ? "1" : "0");
+    else if (typeof v === "string") q.set(k, v);
+    else q.set(k, String(Math.round((v as number) * 1e4) / 1e4));
+  }
+  return q.toString();
+}
+
+function paramsFromQuery(model: PosterModel, sp: URLSearchParams): RenderParams {
+  const p = defaultParams(model);
+  const out = p as Record<string, number | boolean | string>;
+  for (const k of PARAM_KEYS) {
+    const raw = sp.get(k);
+    if (raw == null) continue;
+    if (typeof p[k] === "boolean") {
+      out[k] = raw === "1" || raw === "true";
+    } else if (typeof p[k] === "string") {
+      out[k] = raw;
+    } else {
+      const n = Number(raw);
+      if (Number.isFinite(n)) out[k] = n;
+    }
+  }
+  return p;
+}
+
+function copyLink(model: PosterModel, params: RenderParams) {
+  // the /share URL: it unfurls (OG/Twitter meta + cached poster image) when
+  // pasted, and redirects humans to the exact current view (same params as the
+  // address bar). The bare SPA URL can't unfurl, so this is the shareable link.
+  const url = `${window.location.origin}/share?${paramsQuery(model, params)}`;
   void navigator.clipboard?.writeText(url);
 }
 

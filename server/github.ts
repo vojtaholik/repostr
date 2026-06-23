@@ -183,7 +183,7 @@ async function weeksAcrossLife(
   if (!startSec || nowSec <= startSec) return weeksFromCommits(firstPage);
 
   const span = nowSec - startSec;
-  const BUCKETS = 16;
+  const BUCKETS = 36; // windows across the lifespan — finer = fewer false gaps
   const seen = new Set<string>();
   const counts = new Map<number, number>();
   const add = (c: any) => {
@@ -199,17 +199,24 @@ async function weeksAcrossLife(
   };
 
   for (const c of firstPage) add(c); // newest slice
+  // Probe each time WINDOW independently with since+until, so every window that
+  // had any activity registers — no gaps between sample points (the old
+  // until-only stepping left quiet-looking stretches between buckets even when
+  // the repo was active). A window with >100 commits is capped (busy periods
+  // undercount slightly), which the log-scaled visuals tolerate.
   for (let i = 0; i < BUCKETS; i++) {
+    const sinceSec = startSec + Math.floor((span * i) / BUCKETS);
     const untilSec = startSec + Math.floor((span * (i + 1)) / BUCKETS);
+    const sinceIso = new Date(sinceSec * 1000).toISOString();
     const untilIso = new Date(untilSec * 1000).toISOString();
     try {
       const page = await gh(
-        `/repos/${owner}/${name}/commits?sha=${branch}&per_page=100&until=${encodeURIComponent(untilIso)}`,
+        `/repos/${owner}/${name}/commits?sha=${branch}&per_page=100&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`,
         token
       );
       if (Array.isArray(page)) for (const c of page) add(c);
     } catch {
-      // skip this sample point
+      // skip this window
     }
   }
 

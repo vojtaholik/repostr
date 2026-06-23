@@ -5,6 +5,9 @@
 
 import { colorForLanguage } from "./linguist";
 
+// prerelease tag names we don't want as release landmarks / labels
+const PRERELEASE = /(canary|nightly|alpha|beta|-rc|\.rc|preview|-pre|dev\d|snapshot)/i;
+
 // Hand-picked palettes for specific repos (keyed by lowercase owner/name).
 // These override the auto language colours for the ARTWORK only — the data
 // panel still shows the real languages. Colours are listed dominant-first.
@@ -192,10 +195,14 @@ export function analyze(raw: RawRepo): PosterModel {
     : undefined;
   const paper = REPO_PAPER[slug];
 
-  // Gravity wells: map each tag's date into week-index space.
+  // Gravity wells = the repo's important moments. Prefer stable releases (drop
+  // prereleases — canary/rc/beta/alpha/nightly — so labels stay clean). If the
+  // repo publishes no releases at all (e.g. linux), fall back to the biggest
+  // churn weeks so there's still something to mark as significant.
   const span = Math.max(1, lastT - firstT);
-  const wells: GravityWell[] = raw.tags
+  let wells: GravityWell[] = raw.tags
     .filter((tag) => tag.t >= firstT && tag.t <= lastT && weeks.length > 0)
+    .filter((tag) => !PRERELEASE.test(tag.name))
     .map((tag) => ({
       weekIndex: Math.round(((tag.t - firstT) / span) * (weeks.length - 1)),
       t: tag.t,
@@ -204,6 +211,21 @@ export function analyze(raw: RawRepo): PosterModel {
     // de-dupe wells that collapse onto the same week
     .filter((well, i, arr) => arr.findIndex((w) => w.weekIndex === well.weekIndex) === i)
     .slice(0, 12);
+
+  if (wells.length === 0 && weeks.length > 2) {
+    // churn-peak fallback: the heaviest weeks, spaced out, unlabelled.
+    const ranked = weeks
+      .map((w, i) => ({ i, t: w.t, churn: w.add + w.del }))
+      .sort((a, b) => b.churn - a.churn);
+    const chosen: typeof ranked = [];
+    for (const cand of ranked) {
+      if (chosen.length >= 6) break;
+      // keep peaks spaced apart so they don't pile into one knot
+      if (chosen.some((c) => Math.abs(c.i - cand.i) < weeks.length / 12)) continue;
+      chosen.push(cand);
+    }
+    wells = chosen.map((c) => ({ weekIndex: c.i, t: c.t, label: "" }));
+  }
 
   return {
     slug,
