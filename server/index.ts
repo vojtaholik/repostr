@@ -17,7 +17,9 @@ export default capsule({
     // cached raw GitHub payload (JSON), keyed by slug
     repos: table({
       slug: string(),
-      payload: text(),
+      // JSON blob. Lakebed string() columns cap at 64KB, so payloads are
+      // trimmed to fit before caching (see MAX_VALUE_BYTES in /api/repo).
+      payload: string(),
       fetchedAt: string()
     }),
     // gallery of painted repos (social proof + the "what does mine look like" loop)
@@ -34,7 +36,9 @@ export default capsule({
     // endpoint serves the bytes for link unfurls.
     ogimages: table({
       slug: string(),
-      png: text()
+      // base64 JPEG, rendered client-side and downscaled to fit the 64KB
+      // string() cap (see MAX_VALUE_BYTES in POST /og).
+      png: string()
     })
   },
 
@@ -106,10 +110,12 @@ export default capsule({
 
       try {
         const repo = await fetchRepo(owner, name, ctx.env.GITHUB_TOKEN);
-        const payload = JSON.stringify(repo);
-        // Only cache full-history results. Partial (code_frequency still
-        // computing) results aren't cached, so the next load gets real history.
-        if (!repo.partial) {
+        // Lakebed string() columns cap at 64KB. Trim the heaviest fields
+        // (commit subjects + SHAs are texture-only) until the JSON fits, so
+        // even huge repos cache instead of throwing on insert.
+        const payload = fitPayload(repo);
+        // Only cache full-history results, and only when they fit the cap.
+        if (!repo.partial && payload) {
           for (const row of cached) ctx.db.repos.delete(row.id);
           ctx.db.repos.insert({ slug, payload, fetchedAt: new Date().toISOString() });
         }
@@ -151,6 +157,12 @@ export default capsule({
       if (!slug || !slug.includes("/") || !body) {
         return json({ ok: false }, { status: 400 });
       }
+      // string() columns cap at 64KB. The client downscales the OG JPEG to fit,
+      // but reject anything still over the cap rather than throwing on insert
+      // (the /og fallback SVG covers an un-cached slug).
+      if (utf8Bytes(body) > MAX_VALUE_BYTES) {
+        return json({ ok: false, error: "too_large", bytes: body.length }, { status: 413 });
+      }
       for (const row of ctx.db.ogimages.where("slug", slug).all()) {
         ctx.db.ogimages.delete(row.id);
       }
@@ -165,7 +177,10 @@ export default capsule({
       const slug = (req.query.get("repo") ?? "").trim().toLowerCase();
       let origin = "";
       try {
-        origin = new URL(req.url).origin;
+        // Lakebed terminates TLS at the edge, so req.url's origin is http
+        // internally. Public deploys are always served over https — upgrade it,
+        // since crawlers (Twitter especially) reject http og:image URLs.
+        origin = new URL(req.url).origin.replace(/^http:\/\//, "https://");
       } catch {
         origin = "";
       }
@@ -219,8 +234,6 @@ export default capsule({
 <meta property="og:url" content="${escapeHtml(appUrl)}" />
 <meta property="og:image" content="${escapeHtml(img)}" />${secureImg}
 <meta property="og:image:type" content="image/jpeg" />
-<meta property="og:image:width" content="1200" />
-<meta property="og:image:height" content="1600" />
 <meta property="og:image:alt" content="${escapeHtml(alt)}" />
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="${escapeHtml(t)}" />
@@ -238,6 +251,49 @@ export default capsule({
     })
   }
 });
+
+// --- size helpers -----------------------------------------------------------
+
+// Lakebed string() columns cap each value at 64KB. Leave a little headroom.
+const MAX_VALUE_BYTES = 65536;
+const PAYLOAD_BUDGET = 63000;
+
+// UTF-8 byte length without Node's Buffer (banned in capsule code).
+function utf8Bytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
+}
+
+// Serialize a repo payload, trimming the texture-only fields (commit subjects
+// then SHAs) until it fits the column cap. Returns "" if it can't fit even
+// stripped — caller then skips caching.
+function fitPayload(repo: { commits?: string[]; shas?: string[] }): string {
+  const r = repo as { commits?: string[]; shas?: string[] };
+  const commits = Array.isArray(r.commits) ? r.commits : [];
+  const shas = Array.isArray(r.shas) ? r.shas : [];
+  const caps = [
+    [100, 100],
+    [60, 60],
+    [30, 40],
+    [12, 20],
+    [0, 0]
+  ];
+  for (const [c, s] of caps) {
+    const trimmed = { ...r, commits: commits.slice(0, c), shas: shas.slice(0, s) };
+    const json = JSON.stringify(trimmed);
+    if (utf8Bytes(json) <= PAYLOAD_BUDGET) return json;
+  }
+  return "";
+}
 
 // --- OG helpers -------------------------------------------------------------
 

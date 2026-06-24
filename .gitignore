@@ -2,3 +2,5 @@
 .env.lakebed.server
 
 node_modules/
+prototypes/
+references/

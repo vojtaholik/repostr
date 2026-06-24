@@ -51,6 +51,8 @@ export type RenderParams = {
   gridOpacity: number;
   /** crop into the flow field and scale it up — bigger, calmer colour masses */
   zoom: number;
+  /** translucent era bands under the flow field, inspired by watercolor washes */
+  watercolor: number;
   /** render the gradient as an ordered (Bayer) halftone dither */
   dither: boolean;
   /** what fills the dithered cells: round dots, or hex chars from the SHAs */
@@ -59,6 +61,8 @@ export type RenderParams = {
   pixelSize: number;
   /** how much of the poster the data-driven dither covers (0..1) */
   ditherCoverage: number;
+  /** contrast of the actual dither marks, without painting square cells */
+  ditherContrast: number;
   /** faint commit-message + SHA wallpaper, layered on top */
   sourceText: number;
   /** number of scattered vertical tick marks */
@@ -71,6 +75,18 @@ export type RenderParams = {
   /** density of the data-block layer: random grid cells filled solid, sized +
    * shaded by their churn, coloured by language zone (0 = off) */
   blocks: number;
+  /** negative space: how much clean paper breathes through — clean side margins
+   * plus organic empty zones carved out of the paint (0 = paint everywhere) */
+  negativeSpace: number;
+  // --- topographic engine controls ---
+  /** variant override: auto = seed decides, else force light/dark */
+  dark: "auto" | "light" | "dark";
+  /** iso-contour level spacing — smaller = denser lines */
+  contourGap: number;
+  /** contour stroke width */
+  lineWeight: number;
+  /** churn-dot size multiplier (0 hides them) */
+  dotScale: number;
   wireframe: boolean;
 };
 
@@ -82,18 +98,28 @@ export function defaultParams(model: PosterModel): RenderParams {
     flow: 1,
     spread: 0.55,
     releasePull: 0.6,
-    grain: 0.25,
+    grain: 0.28,
     gridOpacity: 0,
-    zoom: 1,
+    zoom: 1.6,
+    // "telemetry print" defaults: the colour wash is the GROUND (calmer bloom),
+    // while the repo's data — commit-text, halftone, year spine — reads as the
+    // hero. Airbrush softness dialled down; typographic texture dialled up.
+    watercolor: 0.18,
     dither: true,
     ditherStyle: "dots",
     pixelSize: 4,
-    ditherCoverage: 0.1,
-    sourceText: 0.22,
-    tickCount: 26,
-    tickOpacity: 0.32,
+    ditherCoverage: 0.62,
+    ditherContrast: 0.58,
+    sourceText: 0.46,
+    tickCount: 30,
+    tickOpacity: 0.4,
     filaments: false,
-    blocks: 0.2,
+    blocks: 0.24,
+    negativeSpace: 0.4,
+    dark: "auto",
+    contourGap: 0.105,
+    lineWeight: 1.1,
+    dotScale: 1,
     wireframe: false
   };
 }
@@ -109,6 +135,461 @@ type Cell = { col: number; row: number; cx: number; cy: number; add: number; del
 type RGB = { r: number; g: number; b: number };
 type Stroke = { pts: Pt[]; color: RGB; isAdd: boolean; norm: number };
 
+// ---------------------------------------------------------------- art engine
+// repostr's poster is a topographic "git telemetry print": dense iso-contours
+// over a noise flow field warped by weekly activity, with churn dots, release
+// rings, a year-axis timeline scale and a typographic frame. Each repo/seed
+// rolls a variant — light vs dark (glowing), a colour ground, and a zoom level.
+
+const ART = { X0: 64, Y0: 74, X1: W - 64, Y1: H - 90 };
+const ART_NEUTRALS: RGB[] = [
+  "#e9e5d6", "#e4e7df", "#e7e2ea", "#dfe6e8", "#efe7d4", "#eae1de", "#dde4e2", "#e8e4dd"
+].map(hexToRgb);
+
+// Curated Riso/poster-grade palettes — d:1 = dark (i = glowing contour colour),
+// d:0 = light (i = ink/contour colour). a = accent (release rings + pop). Bold,
+// spectrum-spanning, decoupled from language so repos don't all look the same.
+type Pal = { dark: boolean; ground: RGB; frameInk: RGB; lineCol: RGB; accent: RGB };
+const PALS: Array<{ d: number; g: string; i: string; a: string }> = [
+  { d: 0, g: "#e8e3d3", i: "#1b1915", a: "#e2603a" }, // sand / orange
+  { d: 0, g: "#efe7d4", i: "#4a1e1b", a: "#c8463a" }, // cream / oxblood
+  { d: 0, g: "#dce6dc", i: "#1f3a2e", a: "#d98a3d" }, // sage / ochre
+  { d: 0, g: "#dbe5ec", i: "#16233a", a: "#e2603a" }, // pale blue / navy
+  { d: 0, g: "#e7e1ee", i: "#352247", a: "#cf7fae" }, // lilac / plum
+  { d: 0, g: "#efe7c6", i: "#23201a", a: "#2f6f6f" }, // butter / teal
+  { d: 0, g: "#d8ece4", i: "#163a32", a: "#ef6f5a" }, // mint / coral
+  { d: 0, g: "#f1ddcf", i: "#52211f", a: "#2f6f6f" }, // peach / maroon
+  { d: 0, g: "#e9e6dd", i: "#13494a", a: "#e8a13a" }, // bone / deep teal
+  { d: 0, g: "#ece5da", i: "#372a58", a: "#e0633f" }, // oat / violet
+  { d: 0, g: "#e6e8ea", i: "#1c1c20", a: "#ff5da2" }, // grey / riso pink
+  { d: 1, g: "#0c0c10", i: "#ff5da2", a: "#49d6e0" }, // black / pink glow
+  { d: 1, g: "#0a0f18", i: "#49d6e0", a: "#ffd23f" }, // ink / cyan glow
+  { d: 1, g: "#0b0e0a", i: "#b6f24a", a: "#ff8a3d" }, // black / acid green
+  { d: 1, g: "#150d14", i: "#ff8a3d", a: "#ff5da2" }, // plum / orange glow
+  { d: 1, g: "#100f0c", i: "#f2c14a", a: "#7fe0c0" }, // charcoal / gold
+  { d: 1, g: "#0c0a14", i: "#b18cff", a: "#5de0a0" }, // black / violet glow
+  { d: 1, g: "#0a1012", i: "#5de0c8", a: "#ff6f6f" }  // black / aqua glow
+];
+function satOf(c: RGB): number {
+  const mx = Math.max(c.r, c.g, c.b), mn = Math.min(c.r, c.g, c.b);
+  return mx === 0 ? 0 : (mx - mn) / mx;
+}
+function pickPalette(rng: () => number, forced: string, base: RGB, mono: boolean): Pal {
+  if (mono) {
+    // repos with a greyscale dominant colour (e.g. next.js) stay black & white
+    const isDark = forced === "dark" ? true : forced === "light" ? false : rng() < 0.45;
+    return isDark
+      ? { dark: true, ground: hexToRgb("#0c0c0d"), frameInk: { r: 233, g: 231, b: 226 }, lineCol: { r: 233, g: 231, b: 226 }, accent: { r: 150, g: 150, b: 150 } }
+      : { dark: false, ground: hexToRgb("#ece9e2"), frameInk: hexToRgb("#1a1a18"), lineCol: hexToRgb("#1a1a18"), accent: { r: 95, g: 95, b: 95 } };
+  }
+  let pool = PALS;
+  if (forced === "light") pool = PALS.filter((p) => !p.d);
+  else if (forced === "dark") pool = PALS.filter((p) => p.d);
+  const p = pool[Math.floor(rng() * pool.length)] || PALS[0];
+  const ground = hexToRgb(p.g);
+  const lineCol = hexToRgb(p.i);
+  // ~1/3 of the time tie the accent to the repo's dominant language hue
+  const accent = rng() < 0.33 ? base : hexToRgb(p.a);
+  const frameInk = p.d ? { r: 230, g: 228, b: 222 } : lineCol;
+  return { dark: !!p.d, ground, frameInk, lineCol, accent };
+}
+
+function rgba(c: RGB, a: number): string {
+  return `rgba(${c.r | 0},${c.g | 0},${c.b | 0},${a})`;
+}
+function lightenC(c: RGB, t: number): RGB {
+  return lerpRgb(c, { r: 255, g: 255, b: 255 }, t);
+}
+function darkenC(c: RGB, t: number): RGB {
+  return lerpRgb(c, { r: 0, g: 0, b: 0 }, t);
+}
+
+// 2D simplex noise (Gustavson), seeded — the flow field the contours trace.
+function createNoise2D(seed: number): (x: number, y: number) => number {
+  const G = [[1, 1], [-1, 1], [1, -1], [-1, -1], [1, 0], [-1, 0], [0, 1], [0, -1]];
+  const perm = new Uint8Array(512);
+  const src = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) src[i] = i;
+  let s = seed >>> 0;
+  for (let i = 255; i > 0; i--) {
+    s = (s ^ (s << 13)) >>> 0;
+    s = (s ^ (s >>> 17)) >>> 0;
+    s = (s ^ (s << 5)) >>> 0;
+    const j = s % (i + 1);
+    const t = src[i];
+    src[i] = src[j];
+    src[j] = t;
+  }
+  for (let i = 0; i < 256; i++) {
+    perm[i] = src[i];
+    perm[i + 256] = src[i];
+  }
+  const F2 = 0.5 * (Math.sqrt(3) - 1);
+  const G2 = (3 - Math.sqrt(3)) / 6;
+  const dot = (g: number[], x: number, y: number) => g[0] * x + g[1] * y;
+  return (xin, yin) => {
+    const sk = (xin + yin) * F2;
+    const i = Math.floor(xin + sk);
+    const j = Math.floor(yin + sk);
+    const t = (i + j) * G2;
+    const x0 = xin - (i - t);
+    const y0 = yin - (j - t);
+    let i1, j1;
+    if (x0 > y0) { i1 = 1; j1 = 0; } else { i1 = 0; j1 = 1; }
+    const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2, x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+    const ii = i & 255, jj = j & 255;
+    const gi0 = perm[ii + perm[jj]] % 8;
+    const gi1 = perm[ii + i1 + perm[jj + j1]] % 8;
+    const gi2 = perm[ii + 1 + perm[jj + 1]] % 8;
+    let n0 = 0, n1 = 0, n2 = 0;
+    let tt = 0.5 - x0 * x0 - y0 * y0;
+    if (tt >= 0) { tt *= tt; n0 = tt * tt * dot(G[gi0], x0, y0); }
+    tt = 0.5 - x1 * x1 - y1 * y1;
+    if (tt >= 0) { tt *= tt; n1 = tt * tt * dot(G[gi1], x1, y1); }
+    tt = 0.5 - x2 * x2 - y2 * y2;
+    if (tt >= 0) { tt *= tt; n2 = tt * tt * dot(G[gi2], x2, y2); }
+    return 70 * (n0 + n1 + n2);
+  };
+}
+
+// marching squares: draw iso-lines of a scalar field at the given levels.
+function isoContours(
+  ctx: CanvasRenderingContext2D,
+  field: (x: number, y: number) => number,
+  levels: number[],
+  cell: number,
+  X0: number,
+  Y0: number,
+  X1: number,
+  Y1: number,
+  mask?: (x: number, y: number) => boolean
+): void {
+  const cols = Math.ceil((X1 - X0) / cell);
+  const rows = Math.ceil((Y1 - Y0) / cell);
+  const vals: number[][] = [];
+  for (let j = 0; j <= rows; j++) {
+    vals[j] = [];
+    for (let i = 0; i <= cols; i++) vals[j][i] = field(X0 + i * cell, Y0 + j * cell);
+  }
+  const segTable: Record<number, number[]> = {
+    1: [3, 2], 2: [2, 1], 3: [3, 1], 4: [0, 1], 6: [0, 2], 7: [0, 3],
+    8: [0, 3], 9: [0, 2], 11: [0, 1], 12: [3, 1], 13: [2, 1], 14: [3, 2]
+  };
+  const pt = (edge: number, x: number, y: number, tl: number, tr: number, br: number, bl: number, lv: number): [number, number] => {
+    const f = (a: number, b: number) => {
+      const d = b - a;
+      return Math.abs(d) < 1e-9 ? 0.5 : (lv - a) / d;
+    };
+    if (edge === 0) return [x + cell * f(tl, tr), y];
+    if (edge === 1) return [x + cell, y + cell * f(tr, br)];
+    if (edge === 2) return [x + cell * f(bl, br), y + cell];
+    return [x, y + cell * f(tl, bl)];
+  };
+  for (const lv of levels) {
+    ctx.beginPath();
+    for (let j = 0; j < rows; j++)
+      for (let i = 0; i < cols; i++) {
+        const x = X0 + i * cell, y = Y0 + j * cell;
+        if (mask && !mask(x, y)) continue; // negative-space carve-out
+        const tl = vals[j][i], tr = vals[j][i + 1], br = vals[j + 1][i + 1], bl = vals[j + 1][i];
+        let idx = 0;
+        if (tl > lv) idx |= 8;
+        if (tr > lv) idx |= 4;
+        if (br > lv) idx |= 2;
+        if (bl > lv) idx |= 1;
+        const draw = (a: number, b: number) => {
+          const p0 = pt(a, x, y, tl, tr, br, bl, lv);
+          const p1 = pt(b, x, y, tl, tr, br, bl, lv);
+          ctx.moveTo(p0[0], p0[1]);
+          ctx.lineTo(p1[0], p1[1]);
+        };
+        if (idx === 5) { draw(0, 3); draw(2, 1); }
+        else if (idx === 10) { draw(0, 1); draw(3, 2); }
+        else if (segTable[idx]) draw(segTable[idx][0], segTable[idx][1]);
+      }
+    ctx.stroke();
+  }
+}
+
+// big repo name set 90° up the right edge — a typographic anchor that reads as
+// a ghosted watermark behind the field (timeline lives on the left, so no clash)
+function artSideName(ctx: CanvasRenderingContext2D, model: PosterModel, ink: RGB): void {
+  const { X1, Y0, Y1 } = ART;
+  const name = (model.name || "").toLowerCase();
+  if (!name) return;
+  const FH = Y1 - Y0;
+  ctx.font = "700 100px Helvetica, Arial, sans-serif";
+  const w100 = ctx.measureText(name).width || 1;
+  const fs = clamp((FH * 0.92) / w100 * 100, 40, 230);
+  ctx.font = `700 ${fs}px Helvetica, Arial, sans-serif`;
+  const tw = ctx.measureText(name).width;
+  ctx.save();
+  ctx.translate(X1 - fs - 4, Y1 - (FH - tw) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = rgba(ink, 0.16);
+  ctx.fillText(name, 0, 0);
+  ctx.restore();
+}
+
+function artTimeline(ctx: CanvasRenderingContext2D, model: PosterModel, ink: RGB): void {
+  if (!model.firstT || !model.lastT) return;
+  const { X0, Y0, Y1 } = ART;
+  const span = Math.max(1, model.lastT - model.firstT);
+  const yOf = (t: number) => Y0 + ((t - model.firstT) / span) * (Y1 - Y0);
+  const ax = X0 + 6;
+  ctx.strokeStyle = rgba(ink, 0.42);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(ax, Y0);
+  ctx.lineTo(ax, Y1);
+  ctx.stroke();
+  const fy = new Date(model.firstT * 1000).getUTCFullYear();
+  const ly = new Date(model.lastT * 1000).getUTCFullYear();
+  const step = Math.max(1, Math.ceil((ly - fy + 1) / 12));
+  ctx.font = `14px ${MONO}`;
+  ctx.textBaseline = "middle";
+  const darkInk = (ink.r * 0.299 + ink.g * 0.587 + ink.b * 0.114) / 255 > 0.5;
+  for (let Y = fy; Y <= ly; Y++) {
+    const isL = (Y - fy) % step === 0 || Y === ly;
+    const ys = Date.UTC(Y, 0, 1) / 1000;
+    if (ys < model.firstT || ys > model.lastT) continue;
+    const y = yOf(ys);
+    ctx.strokeStyle = rgba(ink, isL ? 0.55 : 0.28);
+    ctx.beginPath();
+    ctx.moveTo(ax, y);
+    ctx.lineTo(ax + (isL ? 9 : 5), y);
+    ctx.stroke();
+    if (isL) {
+      const lx = ax + 14;
+      const t = String(Y);
+      const tw = ctx.measureText(t).width;
+      ctx.fillStyle = darkInk ? "rgba(12,13,18,0.5)" : "rgba(244,242,235,0.62)";
+      ctx.fillRect(lx - 3, y - 9, tw + 6, 18);
+      ctx.fillStyle = rgba(ink, 0.82);
+      ctx.textAlign = "left";
+      ctx.fillText(t, lx, y);
+    }
+  }
+}
+
+function artFooter(ctx: CanvasRenderingContext2D, model: PosterModel, ink: RGB): void {
+  const { X0, X1, Y1 } = ART;
+  const fy = new Date((model.firstT || 0) * 1000).getUTCFullYear();
+  const ly = new Date((model.lastT || 0) * 1000).getUTCFullYear();
+  // one full-width rectangle with two rows; each row has a left + right field
+  const y0 = Y1 + 12, h = 52, mid = y0 + h / 2;
+  ctx.strokeStyle = rgba(ink, 0.5);
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(X0, y0, X1 - X0, h);
+  ctx.beginPath();
+  ctx.moveTo(X0, mid);
+  ctx.lineTo(X1, mid);
+  ctx.stroke();
+  ctx.font = `13px ${MONO}`;
+  ctx.textBaseline = "middle";
+  const padL = X0 + 10, padR = X1 - 10, r1 = y0 + h * 0.25, r2 = y0 + h * 0.75;
+  // top row: repo · span
+  ctx.fillStyle = rgba(ink, 0.82);
+  ctx.textAlign = "left";
+  ctx.fillText(`${model.owner}/${model.name}`.toLowerCase(), padL, r1);
+  ctx.fillStyle = rgba(ink, 0.7);
+  ctx.textAlign = "right";
+  ctx.fillText(`${fy}  →  ${ly}`, padR, r1);
+  // bottom row: identity · stats (no language — that lives in the app caption)
+  ctx.fillStyle = rgba(ink, 0.6);
+  ctx.textAlign = "left";
+  ctx.fillText("repostr.lakebed.app — git history as print", padL, r2);
+  ctx.textAlign = "right";
+  ctx.fillText(`${model.totalWeeks} wks · ${model.wells.length} rel`, padR, r2);
+}
+
+function artPoster(ctx: CanvasRenderingContext2D, model: PosterModel, params: RenderParams): void {
+  const { X0, Y0, X1, Y1 } = ART;
+  const pal = model.paletteOverride?.length
+    ? model.paletteOverride.map((p) => p.color)
+    : model.palette.map((p) => p.color);
+  const base = hexToRgb(pal[0] || "#8a8a8a");
+  const c2 = hexToRgb(pal[1] || pal[0] || "#8a8a8a");
+  // shuffle re-rolls everything via params.seed (model.seed is the fixed default)
+  const seed = (params.seed >>> 0) || model.seed;
+  const rng = makeRng((seed ^ 0xa5a5a5) >>> 0);
+
+  // variant: dark (glowing) vs light (ink on coloured ground). The seed rolls it;
+  // a dark paper override or the `dark` control can force it. We always consume
+  // the roll so later rolls (ground, zoom) stay deterministic.
+  const paperLum = model.paper
+    ? (hexToRgb(model.paper).r * 0.299 + hexToRgb(model.paper).g * 0.587 + hexToRgb(model.paper).b * 0.114) / 255
+    : 1;
+  const forced = params.dark !== "auto" ? params.dark : model.paper && paperLum < 0.45 ? "dark" : "auto";
+  // a greyscale dominant colour (e.g. next.js's charcoal override) -> stay B&W
+  const mono = satOf(base) < 0.12;
+  const PAL = pickPalette(rng, forced, base, mono);
+  const dark = PAL.dark;
+  const glow = dark;
+  const ink = PAL.frameInk;
+  ctx.fillStyle = rgba(PAL.ground, 1);
+  ctx.fillRect(0, 0, W, H);
+
+  // zoom widens the contour masses (slider/shuffle-controlled); the seed only
+  // shifts the crop so each poster samples a different patch of the field
+  const zoom = clamp(params.zoom || 1, 1, 4);
+  const ox = rng() * 5000, oy = rng() * 5000;
+  const noise = createNoise2D(seed);
+  const sc = 0.0022 / zoom;
+  const span = Math.max(1, model.lastT - model.firstT);
+  const maxChurn = Math.max(1, ...model.weeks.map((w) => w.add + w.del));
+  const actAt = (f: number) => {
+    let best = 0;
+    for (const w of model.weeks) {
+      const wf = (w.t - model.firstT) / span;
+      if (Math.abs(wf - f) < 0.03) best = Math.max(best, (w.add + w.del) / maxChurn);
+    }
+    return best;
+  };
+  const field = (x: number, y: number) => {
+    const act = actAt((y - Y0) / (Y1 - Y0));
+    return noise((x + ox) * sc * (1 + act * 0.9), (y + oy) * sc * (1 + act * 0.5));
+  };
+
+  // STRUCTURED NEGATIVE SPACE — the field is split into blocks of VARYING width
+  // and height (seeded column/row edges), and whole blocks are sparsely dropped,
+  // so the empties read as irregular architectural tiles rather than a uniform
+  // grid of equal rectangles.
+  const ns = clamp(params.negativeSpace, 0, 0.85);
+  const mrng = makeRng((seed ^ 0x51ed270b) >>> 0);
+  const baseU = (X1 - X0) / 16;
+  const edges = (lo: number, hi: number, units: number[]): number[] => {
+    const e = [lo];
+    while (e[e.length - 1] < hi - 2) {
+      const m = units[Math.floor(mrng() * units.length)];
+      e.push(Math.min(hi, e[e.length - 1] + m * baseU));
+    }
+    return e;
+  };
+  const colEdges = edges(X0, X1, [1, 2, 2, 3, 4]);
+  const rowEdges = edges(Y0, Y1, [1, 2, 2, 3]);
+  const idxOf = (v: number, e: number[]): number => {
+    for (let i = 0; i < e.length - 1; i++) if (v >= e[i] && v < e[i + 1]) return i;
+    return Math.max(0, e.length - 2);
+  };
+  const cellHash = (ci: number, ri: number): number => {
+    let v = (seed ^ Math.imul(ci, 73856093) ^ Math.imul(ri, 19349663)) >>> 0;
+    v = Math.imul(v ^ (v >>> 15), v | 1);
+    v ^= v + Math.imul(v ^ (v >>> 7), v | 61);
+    return ((v >>> 0) % 100000) / 100000;
+  };
+  const present = (x: number, y: number): boolean => {
+    if (ns <= 0.001) return true;
+    return cellHash(idxOf(x, colEdges), idxOf(y, rowEdges)) >= ns * 0.6;
+  };
+
+  const gap = clamp(params.contourGap || 0.105, 0.05, 0.28);
+  const lw = clamp(params.lineWeight || 1.1, 0.5, 2.5);
+  const dotScale = clamp(params.dotScale ?? 1, 0, 3);
+  const levels: number[] = [];
+  for (let l = -0.88; l <= 0.88; l += gap) levels.push(l);
+
+  if (params.wireframe) {
+    ctx.strokeStyle = rgba(ink, 0.5);
+    ctx.lineWidth = 1;
+    isoContours(ctx, field, levels, 6, X0, Y0, X1, Y1);
+    artTimeline(ctx, model, ink);
+    artFooter(ctx, model, ink);
+    return;
+  }
+
+  const drawContours = (
+    fld: (x: number, y: number) => number,
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    msk?: (x: number, y: number) => boolean
+  ) => {
+    if (glow) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineWidth = lw * 3.6;
+      ctx.strokeStyle = rgba(PAL.lineCol, 0.05);
+      isoContours(ctx, fld, levels, 5, x0, y0, x1, y1, msk);
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = rgba(lightenC(PAL.lineCol, 0.18), 0.55);
+      isoContours(ctx, fld, levels, 5, x0, y0, x1, y1, msk);
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = rgba(PAL.accent, 0.2);
+      isoContours(ctx, (x, y) => fld(x + 150, y + 90), levels, 6, x0, y0, x1, y1, msk);
+      ctx.restore();
+    } else {
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = rgba(PAL.lineCol, 0.5);
+      isoContours(ctx, fld, levels, 5, x0, y0, x1, y1, msk);
+    }
+  };
+
+  // base field everywhere except the dropped blocks
+  drawContours(field, X0, Y0, X1, Y1, present);
+
+  // those dropped blocks become MAGNIFIER LENSES — each reveals a zoomed-in
+  // close-up of the same field, framed, so empties turn into focal windows.
+  if (ns > 0.001) {
+    const MAG = 2.4;
+    for (let ci = 0; ci < colEdges.length - 1; ci++) {
+      for (let ri = 0; ri < rowEdges.length - 1; ri++) {
+        if (cellHash(ci, ri) >= ns * 0.6) continue;
+        const bx0 = colEdges[ci], bx1 = colEdges[ci + 1];
+        const by0 = rowEdges[ri], by1 = rowEdges[ri + 1];
+        const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2;
+        const fmag = (x: number, y: number) => field(cx + (x - cx) / MAG, cy + (y - cy) / MAG);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(bx0, by0, bx1 - bx0, by1 - by0);
+        ctx.clip();
+        drawContours(fmag, bx0, by0, bx1, by1);
+        ctx.restore();
+        ctx.strokeStyle = rgba(ink, glow ? 0.32 : 0.24);
+        ctx.lineWidth = 1;
+        ctx.strokeRect(bx0, by0, bx1 - bx0, by1 - by0);
+      }
+    }
+  }
+
+  // churn dots, one per week on its time-row
+  const dotCol = glow ? rgba(lightenC(PAL.lineCol, 0.3), 0.92) : rgba(PAL.lineCol, 0.85);
+  for (const w of model.weeks) {
+    const n = (w.add + w.del) / maxChurn;
+    if (n <= 0) continue;
+    const y = Y0 + ((w.t - model.firstT) / span) * (Y1 - Y0);
+    const nx = noise(w.t * 0.00006 + oy, 5.1);
+    const x = X0 + (0.16 + 0.72 * (0.5 + nx * 0.5)) * (X1 - X0);
+    const r = (2 + Math.sqrt(n) * 14) * dotScale;
+    if (r < 0.4) continue;
+    if (!present(x, y)) continue;
+    ctx.fillStyle = dotCol;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // release rings
+  for (const wl of model.wells) {
+    if (wl.t < model.firstT || wl.t > model.lastT) continue;
+    const y = Y0 + ((wl.t - model.firstT) / span) * (Y1 - Y0);
+    const nx = noise(wl.t * 0.00006 + oy, 2.7);
+    const x = X0 + (0.16 + 0.72 * (0.5 + nx * 0.5)) * (X1 - X0);
+    ctx.strokeStyle = rgba(PAL.accent, glow ? 0.95 : 0.85);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  artTimeline(ctx, model, ink);
+  artFooter(ctx, model, ink);
+  // white-noise grain reads much hotter on a dark ground — keep just a touch
+  grain(ctx, glow ? Math.min(params.grain, 0.16) * 0.75 : params.grain);
+}
+
 export function renderPoster(
   canvas: HTMLCanvasElement,
   model: PosterModel,
@@ -121,62 +602,7 @@ export function renderPoster(
   if (!ctx) return;
   ctx.scale(scale, scale);
   ctx.textBaseline = "alphabetic";
-
-  // resolve paper + ink (inverted when the paper is dark)
-  RP_PAPER = model.paper ?? PAPER;
-  RP_PAPER_RGB = hexToRgb(RP_PAPER);
-  const lum = (RP_PAPER_RGB.r * 0.299 + RP_PAPER_RGB.g * 0.587 + RP_PAPER_RGB.b * 0.114) / 255;
-  const darkBg = lum < 0.45;
-  RP_INK = darkBg ? "226,224,218" : "26,24,19";
-  RP_INK_HEX = darkBg ? "#e2e0da" : INK;
-
-  const rng = makeRng((params.seed >>> 0) || 1);
-  const cols = 8;
-  const rows = rowCount(model);
-  const cells = buildCells(model, cols, rows);
-  const wells = wellPositions(model, cols, rows);
-
-  // Build the flow strokes from a DEDICATED rng so they're identical in both
-  // wireframe and painted mode (independent of whatever else consumes the main
-  // rng first). This is what makes the wireframe match the painting's flow.
-  const strokeRng = makeRng((params.seed >>> 0) || 1);
-  const strokes = buildStrokes(ctx, model, params, cells, wells, strokeRng);
-
-  paper(ctx);
-
-  if (params.wireframe) {
-    // full, uncropped scaffolding — grid + axis stay aligned. The strokes come
-    // from strokeRng so they're the exact bones the painting is built on (the
-    // painted view is a zoomed crop of these same lines).
-    if (params.sourceText > 0.001) textWallpaper(ctx, model, params, rng);
-    grid(ctx, cols, rows, 0.5);
-    drawWireLines(ctx, strokes);
-    wellMarks(ctx, wells, 0.5);
-    wireframeCells(ctx, cells);
-    timeMarkers(ctx, model, 0.45);
-    cornerBlock(ctx, model);
-    return;
-  }
-
-  // smooth airbrush gradient base
-  const field = sprayField(ctx, strokes, rng, params, model.seed);
-  // thin full-res flow lines layered over the base — only when enabled (off
-  // means off); release-converging lines get emphasised within the layer.
-  if (field && params.filaments) filamentPass(ctx, strokes, field, 1, rng, wells);
-  // masked, feathered halftone dither — radiates from the release wells
-  if (params.dither) ditherOverlay(ctx, field, params, model, wells, rng);
-  // scattered solid data-blocks (random cells, sized + shaded by their churn)
-  gridBlocks(ctx, model, params, rng);
-  // layered on top: the faint commit-message + SHA wallpaper (source material)
-  if (params.sourceText > 0.001) textWallpaper(ctx, model, params, rng);
-  if (params.gridOpacity > 0.001) grid(ctx, cols, rows, params.gridOpacity);
-  tickMarks(ctx, params, rng);
-  timeMarkers(ctx, model, 0.3);
-  // release landmarks (rings + version labels) — the important moments, printed
-  if (field) releaseLandmarks(ctx, model, wells, field, 1);
-  grain(ctx, params.grain); // film grain over everything
-  vignette(ctx);
-  cornerBlock(ctx, model);
+  artPoster(ctx, model, params);
 }
 
 // renders the print poster to a fresh high-resolution canvas (for PNG export)
@@ -186,14 +612,46 @@ export function renderToDataUrl(model: PosterModel, params: RenderParams, scale 
   return off.toDataURL("image/png");
 }
 
-// Renders the OG share image: just the poster itself at its native tall 3:4
-// (1200x1600), no card chrome or text. Uploaded by the client and served from
-// /og. JPEG (not PNG) because the poster's grain is near-incompressible as PNG
-// (multi-MB) but compresses to a couple hundred KB as JPEG.
+// Renders the OG share image: just the poster itself at its native tall 3:4,
+// no card chrome or text. Uploaded by the client and served from /og.
+//
+// Lakebed string() columns cap at 64KB, so the base64 JPEG must land under
+// ~62k chars. We render the poster once at full res, then downscale + lower
+// quality until the encoded image fits. JPEG (not PNG) because the poster's
+// grain is near-incompressible as PNG.
 export function renderOgDataUrl(model: PosterModel, params: RenderParams): string {
-  const off = document.createElement("canvas");
-  renderPoster(off, model, params, 1); // 1200x1600
-  return off.toDataURL("image/jpeg", 0.85);
+  const src = document.createElement("canvas");
+  renderPoster(src, model, params, 1); // 1200x1600 source
+
+  const MAX_B64 = 62000;
+  const widths = [600, 528, 456, 384, 324];
+  const qualities = [0.6, 0.5, 0.42, 0.35, 0.3];
+  let smallest = "";
+  let smallestLen = Infinity;
+
+  for (const w of widths) {
+    const h = Math.round((w * src.height) / src.width);
+    const off = document.createElement("canvas");
+    off.width = w;
+    off.height = h;
+    const ctx = off.getContext("2d");
+    if (!ctx) continue;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, w, h);
+    for (const q of qualities) {
+      const url = off.toDataURL("image/jpeg", q);
+      const len = (url.split(",")[1] ?? "").length;
+      if (len <= MAX_B64) return url;
+      if (len < smallestLen) {
+        smallestLen = len;
+        smallest = url;
+      }
+    }
+  }
+  // Nothing fit (very grainy poster) — return the smallest we made; the server
+  // rejects oversize uploads and the /og SVG fallback covers the slug.
+  return smallest;
 }
 
 // ----------------------------------------------------------------- geometry
@@ -380,8 +838,9 @@ function sprayField(
   strokes: Stroke[],
   rng: () => number,
   params: RenderParams,
-  seed: number
+  model: PosterModel
 ): Field {
+  const seed = model.seed;
   const fw = 280; // field resolution (also sampled by the dither overlay)
   const fh = Math.round((fw * H) / W);
   const fc = document.createElement("canvas");
@@ -405,6 +864,17 @@ function sprayField(
     return s;
   };
 
+  // zoom: sample a sub-region of the field (close-up crop) for big calm masses.
+  // Computed up-front so the negative-space mask can be evaluated in the SAME
+  // canvas space the crop lands in — that's what keeps the empty zones (and the
+  // clean side margins) aligned across the spray, the dither and the blocks.
+  const { z, fx, fy } = zoomCrop(params, seed);
+  const srcW = fw / z;
+  const srcH = fh / z;
+  const srcX = (fw - srcW) * fx;
+  const srcY = (fh - srcH) * fy;
+  const ns = clamp(params.negativeSpace, 0, 1);
+
   const scaleR = fw / 92; // keep footprint constant across field resolutions
   // BASE layer: large, faint soft dabs along each stroke that merge into the
   // buttery airbrush masses (the soft cloud look). Thin flow detail can't live
@@ -416,21 +886,20 @@ function sprayField(
       const t = i / (n - 1);
       const taper = Math.sin(t * Math.PI);
       const rad = (3.2 + stroke.norm * 8) * (0.5 + taper * 0.9) * scaleR;
-      const a = (0.05 + stroke.norm * 0.1) * (0.4 + taper * 0.9);
+      let a = (0.05 + stroke.norm * 0.1) * (0.4 + taper * 0.9);
       const x = stroke.pts[i].x * sx + (rng() - 0.5) * rad * 0.6;
       const y = stroke.pts[i].y * sy + (rng() - 0.5) * rad * 0.6;
+      if (ns > 0.001) {
+        // canvas-normalized position this field dab maps to after the crop
+        const m = breathMask((x - srcX) / srcW, (y - srcY) / srcH, seed, ns);
+        if (m < 0.05) continue; // truly empty -> leave clean paper
+        a *= m;
+      }
       f.globalAlpha = a;
       f.drawImage(sp, x - rad, y - rad, rad * 2, rad * 2);
     }
   }
   f.globalAlpha = 1;
-
-  // zoom: sample a sub-region of the field (close-up crop) for big calm masses.
-  const { z, fx, fy } = zoomCrop(params, seed);
-  const srcW = fw / z;
-  const srcH = fh / z;
-  const srcX = (fw - srcW) * fx;
-  const srcY = (fh - srcH) * fy;
 
   // always lay down the smooth gradient as the base
   ctx.save();
@@ -440,6 +909,67 @@ function sprayField(
   ctx.restore();
 
   return { f, fw, fh, srcX, srcY, srcW, srcH };
+}
+
+function watercolorWash(
+  ctx: CanvasRenderingContext2D,
+  model: PosterModel,
+  params: RenderParams,
+  width: number,
+  height: number
+): void {
+  const amount = clamp(params.watercolor, 0, 1);
+  if (amount <= 0.001) return;
+
+  const rng = makeRng(((params.seed ^ 0x85ebca6b) >>> 0) || 1);
+  const palette = buildPalette(model, rng);
+  const rows = rowCount(model);
+  const cells = buildCells(model, 8, rows);
+  const maxChurn = Math.max(1, ...cells.map((c) => c.add + c.del));
+  const regions = clamp(Math.round(3 + model.volatility * 5), 3, 8);
+  const regionH = height / regions;
+  const layerCount = Math.round(36 + amount * 140 + model.volatility * 45);
+  const jitter = (10 + model.volatility * 34 + params.spread * 18) * (height / H);
+  const baseAlpha = amount * (0.018 + model.volatility * 0.012);
+  const darkPaper = (RP_PAPER_RGB.r * 0.299 + RP_PAPER_RGB.g * 0.587 + RP_PAPER_RGB.b * 0.114) / 255 < 0.45;
+
+  ctx.save();
+  ctx.globalCompositeOperation = darkPaper ? "screen" : "multiply";
+  for (let r = 0; r < regions; r++) {
+    const top = r * regionH;
+    const t0 = r / regions;
+    const t1 = (r + 0.5) / regions;
+    const eraCells = cells.filter((c) => {
+      const f = rows <= 1 ? 0 : c.row / (rows - 1);
+      return f >= t0 && f < (r + 1) / regions;
+    });
+    const eraChurn =
+      eraCells.reduce((sum, c) => sum + c.add + c.del, 0) / Math.max(1, eraCells.length);
+    const churnLift = Math.log1p(eraChurn) / Math.log1p(maxChurn);
+    const a = baseAlpha * (0.65 + churnLift * 1.3);
+    const topColor = washColor(pickLang(palette, coherentNoise(W * 0.35, GY0 + t0 * (GY1 - GY0), model.seed)), rng);
+    const botColor = washColor(pickLang(palette, coherentNoise(W * 0.65, GY0 + t1 * (GY1 - GY0), model.seed)), rng);
+
+    for (let l = 0; l < layerCount; l++) {
+      const y = top + (rng() * (regionH + jitter * 2) - jitter);
+      const x = rng() * width - width * 0.18;
+      const w = width * (0.45 + rng() * 0.85);
+      const h = regionH * (0.12 + rng() * 0.55);
+      const mix = clamp((y - top) / regionH, 0, 1);
+      const c = lerpRgb(topColor, botColor, mix);
+      ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
+      ctx.globalAlpha = a * (0.45 + rng() * 1.2);
+      ctx.fillRect(x, y, w, h);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+}
+
+function washColor(lang: LangPigment, rng: () => number): RGB {
+  const shades = lang.shades;
+  return shades[clamp(Math.round((0.35 + rng() * 0.55) * (shades.length - 1)), 0, shades.length - 1)];
 }
 
 type Field = {
@@ -593,6 +1123,7 @@ function gridBlocks(
 ): void {
   const amount = clamp(params.blocks, 0, 1);
   if (amount <= 0) return;
+  const ns = clamp(params.negativeSpace, 0, 1);
   const cols = 8;
   const rows = rowCount(model);
   const cells = buildCells(model, cols, rows);
@@ -689,6 +1220,13 @@ function gridBlocks(
       // break the blocks up into drifting islands (always on).
       const m2 = maskNoise(mcx, mcy, (params.seed ^ 0x9e3779b9) >>> 0, params.volatility, params.flow);
       fade *= 1 - smoothstep(0.3, 0.82, m2) * 0.96;
+      // honour the same negative-space zones the paint leaves open, so blocks
+      // don't fill the breathing room (uses canvas-normalized coords like spray)
+      if (ns > 0.001) {
+        const bm = breathMask(mcx / W, mcy / H, model.seed, ns);
+        if (bm < 0.06) continue;
+        fade *= bm;
+      }
       // wide per-block opacity, occasionally near-solid for pop
       ctx.globalAlpha = clamp(0.22 + rng() * rng() * 1.0, 0.16, 0.92) * fade;
       ctx.fillStyle = `rgb(${col.r},${col.g},${col.b})`;
@@ -736,6 +1274,7 @@ function ditherOverlay(
   const cols = Math.ceil(W / step);
   const rows = Math.ceil(H / step);
   const dotR = Math.max(0.8, step * 0.46);
+  const contrast = clamp(params.ditherContrast, 0, 1);
   // dither area is data-driven: denser + more volatile repos bubble through
   // more of the poster; the slider is a manual master on top.
   const coverage = clamp(params.ditherCoverage, 0, 1);
@@ -777,10 +1316,6 @@ function ditherOverlay(
       const g = data[idx + 1];
       const b = data[idx + 2];
 
-      ctx.globalAlpha = m;
-      ctx.fillStyle = RP_PAPER;
-      ctx.fillRect(ox, oy, step + 0.6, step + 0.6);
-
       const dr = r - RP_PAPER_RGB.r;
       const dg = g - RP_PAPER_RGB.g;
       const db = b - RP_PAPER_RGB.b;
@@ -788,14 +1323,28 @@ function ditherOverlay(
       const v = clamp(0.1 + Math.pow(dist / 175, 0.85) * 0.8, 0, 1);
       // cells thin out progressively toward the edges -> soft, large feather
       if (v > BAYER8[gy & 7][gx & 7] && rng() < m * m) {
+        const markAlpha = clamp(m * (0.45 + contrast * 0.9), 0, 1);
+        const paperAlpha = clamp(m * (0.12 + contrast * 0.58), 0, 0.82);
         ctx.fillStyle = `rgb(${r},${g},${b})`;
         if (hex) {
           const ch = hexStream[hi % hexStream.length];
           hi++;
+          ctx.lineWidth = Math.max(1, step * 0.18);
+          ctx.strokeStyle = RP_PAPER;
+          ctx.globalAlpha = paperAlpha;
+          ctx.strokeText(ch, ox + step / 2, oy + step / 2);
+          ctx.globalAlpha = markAlpha;
           ctx.fillText(ch, ox + step / 2, oy + step / 2);
         } else {
+          ctx.globalAlpha = paperAlpha;
+          ctx.fillStyle = RP_PAPER;
           ctx.beginPath();
-          ctx.arc(ox + step / 2, oy + step / 2, dotR, 0, Math.PI * 2);
+          ctx.arc(ox + step / 2, oy + step / 2, dotR * 1.05, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = markAlpha;
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          ctx.beginPath();
+          ctx.arc(ox + step / 2, oy + step / 2, dotR * (0.68 + contrast * 0.22), 0, Math.PI * 2);
           ctx.fill();
         }
       }
@@ -808,6 +1357,48 @@ function ditherOverlay(
 function smoothstep(e0: number, e1: number, x: number): number {
   const t = clamp((x - e0) / (e1 - e0), 0, 1);
   return t * t * (3 - 2 * t);
+}
+
+// Smooth low-frequency value field in 0..1 from a handful of seeded sine lobes —
+// the basis for organic empty zones. Coords are canvas-normalized (0..1).
+function breatheNoise(nx: number, ny: number, seed: number): number {
+  const a = ((seed % 997) / 997) * 6.2831853;
+  const b = (((seed >>> 5) % 991) / 991) * 6.2831853;
+  const c = (((seed >>> 13) % 983) / 983) * 6.2831853;
+  const v =
+    Math.sin(nx * 2.3 + a) * 0.55 +
+    Math.cos(ny * 2.7 + b) * 0.5 +
+    Math.sin((nx + ny) * 1.7 + c) * 0.45 +
+    Math.cos((nx - ny) * 3.1 + a * 0.6) * 0.32;
+  return clamp(0.5 + v / 3.3, 0, 1);
+}
+
+// Presence mask (0 = clean paper, 1 = full paint) in canvas-normalized coords.
+// Two ingredients, both seeded per-repo so no two posters breathe alike:
+//   • asymmetric clean margins on all four sides (the "looks good from the
+//     sides" Zeh trait — paint never runs to the edge)
+//   • organic interior voids carved where the low-freq field dips
+// `amount` scales the whole effect; at 0 it returns 1 (paint everywhere).
+function breathMask(nx: number, ny: number, seed: number, amount: number): number {
+  if (amount <= 0.001) return 1;
+  const lm = 0.04 + ((seed >>> 3) % 100) / 100 * 0.09;
+  const rm = 0.04 + ((seed >>> 11) % 100) / 100 * 0.09;
+  const tm = 0.03 + ((seed >>> 17) % 100) / 100 * 0.06;
+  const bm = 0.03 + ((seed >>> 23) % 100) / 100 * 0.06;
+  const edge =
+    smoothstep(0, lm + 0.05, nx) *
+    smoothstep(0, rm + 0.05, 1 - nx) *
+    smoothstep(0, tm + 0.05, ny) *
+    smoothstep(0, bm + 0.05, 1 - ny);
+  const field = breatheNoise(nx, ny, seed);
+  const thr = 0.16 + amount * 0.46; // more amount -> wider voids
+  const voids = smoothstep(thr - 0.13, thr + 0.12, field);
+  // Side/edge margins clean up faster than interior voids: even a gentle setting
+  // pulls the paint off the edges, while the organic interior holes only open up
+  // as the slider climbs.
+  const edgeApplied = 1 - Math.min(1, amount * 1.6) * (1 - edge);
+  const voidApplied = 1 - amount * (1 - voids);
+  return clamp(edgeApplied * voidApplied, 0, 1);
 }
 
 // soft 0..1 falloff that peaks at each release well — the dither blooms here
@@ -1005,22 +1596,44 @@ function tickMarks(ctx: CanvasRenderingContext2D, params: RenderParams, rng: () 
 
 // year labels placed at their true linear vertical position (a real time axis),
 // so they span exactly first->last year and agree with the corner block.
+// The time-spine: repostr's backbone. A faint vertical axis down the left
+// margin with a small tick + year label at each year — the repo's lifespan made
+// into the structure everything else hangs from.
 function timeMarkers(ctx: CanvasRenderingContext2D, model: PosterModel, opacity: number): void {
   if (!model.firstT || !model.lastT) return;
   const span = Math.max(1, model.lastT - model.firstT);
   const fy = new Date(model.firstT * 1000).getUTCFullYear();
   const ly = new Date(model.lastT * 1000).getUTCFullYear();
   const step = Math.max(1, Math.ceil((ly - fy + 1) / 12)); // keep ≤ ~12 labels
+  const axisX = GX0 - 30;
+
   ctx.save();
+  // the spine itself — hairline, quieter than the labels
+  ctx.strokeStyle = `rgba(${RP_INK},${opacity * 0.5})`;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(axisX, GY0);
+  ctx.lineTo(axisX, GY1);
+  ctx.stroke();
+
   ctx.font = `9px ${MONO}`;
-  ctx.fillStyle = `rgba(${RP_INK},${opacity})`;
-  ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   for (let Y = fy; Y <= ly; Y++) {
-    if ((Y - fy) % step !== 0 && Y !== ly) continue;
+    const isLabel = (Y - fy) % step === 0 || Y === ly;
     const ys = Date.UTC(Y, 0, 1) / 1000;
     const f = clamp((ys - model.firstT) / span, 0, 1);
-    ctx.fillText(String(Y), GX0 - 12, GY0 + f * (GY1 - GY0));
+    const y = GY0 + f * (GY1 - GY0);
+    // every year gets a tick; only labelled years carry the number
+    ctx.strokeStyle = `rgba(${RP_INK},${opacity * (isLabel ? 0.9 : 0.4)})`;
+    ctx.beginPath();
+    ctx.moveTo(axisX, y);
+    ctx.lineTo(axisX + (isLabel ? 7 : 4), y);
+    ctx.stroke();
+    if (isLabel) {
+      ctx.fillStyle = `rgba(${RP_INK},${opacity})`;
+      ctx.textAlign = "right";
+      ctx.fillText(String(Y), axisX - 6, y);
+    }
   }
   ctx.restore();
 }
@@ -1221,6 +1834,14 @@ function hslToRgb(h: number, s: number, l: number): RGB {
     r: Math.round((rp + m) * 255),
     g: Math.round((gp + m) * 255),
     b: Math.round((bp + m) * 255)
+  };
+}
+
+function lerpRgb(a: RGB, b: RGB, t: number): RGB {
+  return {
+    r: Math.round(a.r + (b.r - a.r) * t),
+    g: Math.round(a.g + (b.g - a.g) * t),
+    b: Math.round(a.b + (b.b - a.b) * t)
   };
 }
 

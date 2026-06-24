@@ -8,6 +8,17 @@ import { colorForLanguage } from "./linguist";
 // prerelease tag names we don't want as release landmarks / labels
 const PRERELEASE = /(canary|nightly|alpha|beta|-rc|\.rc|preview|-pre|dev\d|snapshot)/i;
 
+// significance of a version string for condensation: major (x.0.0) > minor
+// (x.y.0) > patch. Unparseable names rank lowest.
+function versionRank(name: string): number {
+  const m = name.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return 0;
+  const min = +m[2], pat = +m[3];
+  if (pat === 0 && min === 0) return 3;
+  if (pat === 0) return 2;
+  return 1;
+}
+
 // Hand-picked palettes for specific repos (keyed by lowercase owner/name).
 // These override the auto language colours for the ARTWORK only — the data
 // panel still shows the real languages. Colours are listed dominant-first.
@@ -200,7 +211,8 @@ export function analyze(raw: RawRepo): PosterModel {
   // repo publishes no releases at all (e.g. linux), fall back to the biggest
   // churn weeks so there's still something to mark as significant.
   const span = Math.max(1, lastT - firstT);
-  let wells: GravityWell[] = raw.tags
+  // All stable, in-range releases as candidate wells (sorted oldest -> newest).
+  const candidates: GravityWell[] = raw.tags
     .filter((tag) => tag.t >= firstT && tag.t <= lastT && weeks.length > 0)
     .filter((tag) => !PRERELEASE.test(tag.name))
     .map((tag) => ({
@@ -208,9 +220,28 @@ export function analyze(raw: RawRepo): PosterModel {
       t: tag.t,
       label: tag.name
     }))
-    // de-dupe wells that collapse onto the same week
-    .filter((well, i, arr) => arr.findIndex((w) => w.weekIndex === well.weekIndex) === i)
-    .slice(0, 12);
+    .sort((a, b) => a.t - b.t);
+
+  // Condense: prolific repos ship hundreds of releases. Bin the lifespan into
+  // ~18 slots and keep the most SIGNIFICANT release per slot (major > minor >
+  // patch) so the rings spread across time instead of piling onto the newest.
+  const MAX_WELLS = 18;
+  let condensed = candidates;
+  if (candidates.length > MAX_WELLS) {
+    const picked: GravityWell[] = [];
+    for (let b = 0; b < MAX_WELLS; b++) {
+      const lo = firstT + (span * b) / MAX_WELLS;
+      const hi = firstT + (span * (b + 1)) / MAX_WELLS;
+      const inBin = candidates.filter((c) => c.t >= lo && c.t < hi);
+      if (!inBin.length) continue;
+      inBin.sort((a, b2) => versionRank(b2.label) - versionRank(a.label));
+      picked.push(inBin[0]);
+    }
+    condensed = picked;
+  }
+  let wells: GravityWell[] = condensed.filter(
+    (well, i, arr) => arr.findIndex((w) => w.weekIndex === well.weekIndex) === i
+  );
 
   if (wells.length === 0 && weeks.length > 2) {
     // churn-peak fallback: the heaviest weeks, spaced out, unlabelled.

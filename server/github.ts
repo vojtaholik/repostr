@@ -27,10 +27,6 @@ function authHeaders(token?: string): Record<string, string> {
   };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 async function gh(path: string, token?: string): Promise<any> {
   let res: Response;
   try {
@@ -55,40 +51,6 @@ async function gh(path: string, token?: string): Promise<any> {
   return res.json();
 }
 
-// stats endpoints answer 202 (with empty body) while GitHub computes them.
-// GitHub caches the result after the first compute, so persistent polling
-// pays off: the first fetch of a big repo waits, every later fetch is instant.
-async function ghStats(path: string, token?: string, attempts = 7): Promise<any | null> {
-  for (let i = 0; i < attempts; i++) {
-    let res: Response;
-    try {
-      res = await fetch(`${API}${path}`, { headers: authHeaders(token) });
-    } catch {
-      return null;
-    }
-    if (res.status === 403 || res.status === 429) {
-      throw new GitHubError(
-        "GitHub API limit reached. Add a GITHUB_TOKEN to .env.lakebed.server.",
-        "rate_limit",
-        429
-      );
-    }
-    if (res.status === 202) {
-      await sleep(2000);
-      continue;
-    }
-    if (res.status === 204) return [];
-    if (!res.ok) return null;
-    const body = await res.json();
-    if (Array.isArray(body) && body.length === 0) {
-      await sleep(2000);
-      continue;
-    }
-    return body;
-  }
-  return null;
-}
-
 export async function fetchRepo(
   owner: string,
   name: string,
@@ -97,17 +59,18 @@ export async function fetchRepo(
   const repo = await gh(`/repos/${owner}/${name}`, token);
   const branch = repo.default_branch ?? "main";
 
-  // languages + commits + churn in as few calls as possible
-  const languages: Record<string, number> = await gh(
-    `/repos/${owner}/${name}/languages`,
-    token
-  );
-
-  // First commit page powers the SHA + message texture and the overlay.
-  const firstPage: any[] = await gh(
-    `/repos/${owner}/${name}/commits?sha=${branch}&per_page=100`,
-    token
-  ).catch(() => []);
+  // languages, the first commit page, and releases are independent — fetch them
+  // concurrently to stay inside the claimed runtime's 5s budget. The first
+  // commit page powers the SHA + message texture and the overlay.
+  const [languages, firstPage, tags] = await Promise.all([
+    gh(`/repos/${owner}/${name}/languages`, token).catch(
+      () => ({}) as Record<string, number>
+    ),
+    gh(`/repos/${owner}/${name}/commits?sha=${branch}&per_page=100`, token).catch(
+      () => [] as any[]
+    ),
+    fetchReleaseTags(owner, name, token)
+  ]);
   const shas = firstPage
     .map((c) => (typeof c.sha === "string" ? c.sha.slice(0, 7) : null))
     .filter((s): s is string => Boolean(s));
@@ -115,38 +78,23 @@ export async function fetchRepo(
     .map((c) => firstLine(c?.commit?.message ?? ""))
     .filter(Boolean);
 
-  // Weekly churn. Prefer code_frequency (real additions/deletions across the
-  // full lifespan), but GitHub's stats often 202 indefinitely for big repos,
-  // so fall back to paginated commit cadence — reliable, if add/del-approx.
-  let weeks: WeekStat[] = [];
-  let partial = false;
-  const codeFreq = await ghStats(
-    `/repos/${owner}/${name}/stats/code_frequency`,
+  // Weekly churn. The code_frequency stats endpoint 202s while GitHub computes
+  // it, which would need a polling/backoff loop — and Lakebed's claimed runtime
+  // forbids timers. So we sample commits across the repo's whole lifespan
+  // directly (reliable, if add/del-approx): even very active repos (where 500
+  // recent commits = a few weeks) still span their full timeline.
+  let weeks: WeekStat[] = await weeksAcrossLife(
+    owner,
+    name,
+    branch,
     token,
-    3
+    repo.created_at,
+    firstPage
   );
-  if (Array.isArray(codeFreq) && codeFreq.length > 1) {
-    weeks = codeFreq
-      .filter((row: any) => Array.isArray(row) && row.length >= 3)
-      .map((row: number[]) => ({
-        t: row[0],
-        add: Math.max(0, row[1]),
-        del: Math.abs(Math.min(0, row[2]))
-      }))
-      .filter((w) => w.add > 0 || w.del > 0);
-  }
-  if (weeks.length < 2) {
-    // sample commits across the repo's whole life so even very active repos
-    // (where 500 recent commits = a few weeks) span their full timeline
-    weeks = await weeksAcrossLife(owner, name, branch, token, repo.created_at, firstPage);
-    partial = weeks.length < 2;
-  }
+  const partial = weeks.length < 2;
   if (weeks.length === 0) {
     throw new GitHubError("No readable commit history yet.", "empty", 422);
   }
-
-  // releases give dated gravity wells in a single request (no per-tag lookups)
-  const tags = await fetchReleaseTags(owner, name, token);
 
   return {
     owner: repo.owner?.login ?? owner,
@@ -183,7 +131,7 @@ async function weeksAcrossLife(
   if (!startSec || nowSec <= startSec) return weeksFromCommits(firstPage);
 
   const span = nowSec - startSec;
-  const BUCKETS = 36; // windows across the lifespan — finer = fewer false gaps
+  const BUCKETS = 24; // windows across the lifespan — finer = fewer false gaps
   const seen = new Set<string>();
   const counts = new Map<number, number>();
   const add = (c: any) => {
@@ -200,24 +148,24 @@ async function weeksAcrossLife(
 
   for (const c of firstPage) add(c); // newest slice
   // Probe each time WINDOW independently with since+until, so every window that
-  // had any activity registers — no gaps between sample points (the old
-  // until-only stepping left quiet-looking stretches between buckets even when
-  // the repo was active). A window with >100 commits is capped (busy periods
-  // undercount slightly), which the log-scaled visuals tolerate.
+  // had any activity registers — no gaps between sample points. Fired
+  // CONCURRENTLY: Lakebed's claimed runtime caps each request at 5s, so 24
+  // sequential GitHub calls would blow the budget; in parallel they finish in
+  // ~1s. A window with >100 commits is capped (busy periods undercount
+  // slightly), which the log-scaled visuals tolerate.
+  const urls: string[] = [];
   for (let i = 0; i < BUCKETS; i++) {
     const sinceSec = startSec + Math.floor((span * i) / BUCKETS);
     const untilSec = startSec + Math.floor((span * (i + 1)) / BUCKETS);
     const sinceIso = new Date(sinceSec * 1000).toISOString();
     const untilIso = new Date(untilSec * 1000).toISOString();
-    try {
-      const page = await gh(
-        `/repos/${owner}/${name}/commits?sha=${branch}&per_page=100&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`,
-        token
-      );
-      if (Array.isArray(page)) for (const c of page) add(c);
-    } catch {
-      // skip this window
-    }
+    urls.push(
+      `/repos/${owner}/${name}/commits?sha=${branch}&per_page=100&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}`
+    );
+  }
+  const pages = await Promise.all(urls.map((u) => gh(u, token).catch(() => null)));
+  for (const page of pages) {
+    if (Array.isArray(page)) for (const c of page) add(c);
   }
 
   return [...counts.entries()]
@@ -257,12 +205,17 @@ async function fetchReleaseTags(
   token?: string
 ): Promise<RepoTag[]> {
   try {
-    const releases: any[] = await gh(
-      `/repos/${owner}/${name}/releases?per_page=30`,
-      token
+    // Fetch several pages (100/page) IN PARALLEL so releases span the repo's
+    // whole life, not just the last ~30. Active repos ship hundreds of releases;
+    // grabbing only the newest made every ring cluster in the past year.
+    const pages = await Promise.all(
+      [1, 2, 3, 4].map((p) =>
+        gh(`/repos/${owner}/${name}/releases?per_page=100&page=${p}`, token).catch(() => [] as any[])
+      )
     );
+    const releases = pages.flat();
     return releases
-      .filter((r) => !r.draft && (r.published_at || r.created_at))
+      .filter((r) => r && !r.draft && (r.published_at || r.created_at))
       .map((r) => ({
         name: r.tag_name ?? r.name ?? "",
         t: Math.floor(new Date(r.published_at ?? r.created_at).getTime() / 1000)
