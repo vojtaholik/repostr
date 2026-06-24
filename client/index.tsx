@@ -1,4 +1,13 @@
-import { useMutation, useQuery } from "lakebed/client";
+import {
+  Route,
+  Router,
+  Routes,
+  navigate,
+  useLocation,
+  useMutation,
+  useParams,
+  useQuery
+} from "lakebed/client";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   analyze,
@@ -69,6 +78,18 @@ if (typeof document !== "undefined" && !document.getElementById("repostr-fonts")
     }
   `;
   document.head.appendChild(style);
+
+  // SVG favicon: a poster-frame silhouette with topo lines. The media query
+  // lives INSIDE the svg, so it flips for light vs dark browser chrome.
+  if (!document.getElementById("repostr-favicon")) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#17150f" stroke-width="2"><style>@media (prefers-color-scheme:dark){*{stroke:#ecece4}}</style><rect x="6" y="2.5" width="12" height="19"/></svg>`;
+    const icon = document.createElement("link");
+    icon.id = "repostr-favicon";
+    icon.rel = "icon";
+    icon.type = "image/svg+xml";
+    icon.href = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    document.head.appendChild(icon);
+  }
 }
 
 type Phase =
@@ -97,7 +118,53 @@ const SUGGESTIONS = [
 ];
 
 export function App() {
+  return (
+    <main className="min-h-screen bg-[#0c0c0c] font-mono text-[#cfcfcf]">
+      <Router>
+        <Routes>
+          <Route path="/" element={<Landing />} />
+          <Route path="/:owner/:repo" element={<RepoView />} />
+          <Route path="/:owner/:repo/edit" element={<RepoView edit />} />
+          <Route path="*" element={<Landing />} />
+        </Routes>
+      </Router>
+    </main>
+  );
+}
+
+// landing: hero + gallery. picking a repo pushes a real /owner/repo route.
+function Landing() {
   const gallery = useQuery<PosterRow[]>("recentPosters");
+  const [input, setInput] = useState("");
+  const [error, setError] = useState<string | undefined>();
+
+  const go = (raw: string) => {
+    const parsed = parseRepoInput(raw);
+    if (!parsed) {
+      setError("Paste a GitHub repo URL — e.g. github.com/facebook/react.");
+      return;
+    }
+    navigate(`/${parsed.owner}/${parsed.name}`);
+  };
+
+  return (
+    <>
+      <Hero input={input} setInput={setInput} onPaint={() => go(input)} onPick={go} error={error} />
+      <Gallery rows={gallery} onPick={go} />
+    </>
+  );
+}
+
+// one repo, at /:owner/:repo (and /:owner/:repo/edit). Render params live in the
+// query string so copy-link + reload reproduce the exact view; the PATH drives
+// real history entries, so the browser back button works between pages.
+function RepoView({ edit }: { edit?: boolean }) {
+  const routeParams = useParams<{ owner?: string; repo?: string }>();
+  const loc = useLocation();
+  const owner = routeParams.owner ?? "";
+  const name = routeParams.repo ?? "";
+  const slug = slugFor(owner, name);
+
   const recordPoster = useMutation<
     [
       input: {
@@ -113,10 +180,9 @@ export function App() {
   >("recordPoster");
   const ogDone = useRef<Set<string>>(new Set());
 
-  const [input, setInput] = useState("");
-  const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [model, setModel] = useState<PosterModel | null>(null);
   const [params, setParams] = useState<RenderParams | null>(null);
-  const [editorOpen, setEditorOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -129,114 +195,14 @@ export function App() {
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   }
-
-  function copy(model: PosterModel, p: RenderParams) {
-    copyLink(model, p);
+  function copy(m: PosterModel, p: RenderParams) {
+    copyLink(m, p);
     flash("link copied");
   }
-
-  async function paint(rawInput: string, urlParams?: URLSearchParams) {
-    const parsed = parseRepoInput(rawInput);
-    if (!parsed) {
-      setPhase({ kind: "error", message: "Paste a GitHub repo URL — e.g. github.com/facebook/react." });
-      return;
-    }
-    const { owner, name } = parsed;
-    const slug = slugFor(owner, name);
-    const token = ++runToken.current;
-    setInput(`${owner}/${name}`);
-    setEditorOpen(false); // always start in the simple result view
-    setPhase({ kind: "loading", message: "reading the shape", slug });
-    updateUrl(slug);
-
-    try {
-      const res = await fetch(`api/repo?owner=${encodeURIComponent(owner)}&name=${encodeURIComponent(name)}`);
-      const data = await res.json();
-      if (runToken.current !== token) return;
-      if (!res.ok || data.error) {
-        setPhase({ kind: "error", message: data.error ?? `Request failed (${res.status}).` });
-        return;
-      }
-      const model = analyze(data.repo as RawRepo);
-      // a deep link carries the exact view (seed + slider edits); otherwise start
-      // from the repo's defaults.
-      setParams(urlParams ? paramsFromQuery(model, urlParams) : defaultParams(model));
-      setPhase({ kind: "done", model });
-      const top = model.palette[0];
-      void recordPoster({
-        slug: model.slug,
-        owner: model.owner,
-        name: model.name,
-        language: top?.name ?? "",
-        languageColor: top?.color ?? "#8a8a8a",
-        volatility: model.volatility
-      });
-
-      // Warm the OG share card once per repo (default view = canonical image).
-      // Deferred + idle so the heavy offscreen render doesn't block first paint.
-      if (!ogDone.current.has(model.slug)) {
-        ogDone.current.add(model.slug);
-        const warm = () => {
-          try {
-            const dataUrl = renderOgDataUrl(model, defaultParams(model));
-            const b64 = dataUrl.split(",")[1] ?? "";
-            if (b64) {
-              void fetch(`og?repo=${encodeURIComponent(model.slug)}`, {
-                method: "POST",
-                body: b64
-              });
-            }
-          } catch {
-            /* OG is best-effort */
-          }
-        };
-        const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => void })
-          .requestIdleCallback;
-        if (ric) ric(warm);
-        else setTimeout(warm, 800);
-      }
-    } catch {
-      if (runToken.current !== token) return;
-      setPhase({ kind: "error", message: "Network error reaching the server." });
-    }
-  }
-
-  // live render, coalesced to one paint per animation frame
-  useEffect(() => {
-    if (phase.kind !== "done" || !params || !canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const model = phase.model;
-    cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => renderPoster(canvas, model, params));
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [phase, params, editorOpen]);
-
-  useEffect(() => {
-    const sp = new URLSearchParams(window.location.search);
-    const repo = sp.get("repo");
-    if (repo) void paint(repo, sp);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // keep the address bar pointing at the exact current view, so "copy link"
-  // (and a plain reload) always reproduce what's on screen — seed, shuffle, and
-  // every slider edit included.
-  useEffect(() => {
-    if (phase.kind !== "done" || !params) return;
-    window.history.replaceState(
-      null,
-      "",
-      `${window.location.pathname}?${paramsQuery(phase.model, params)}`
-    );
-  }, [phase, params]);
-
   function set<K extends keyof RenderParams>(key: K, value: RenderParams[K]) {
     setParams((p) => (p ? { ...p, [key]: value } : p));
   }
-
   function shuffle() {
-    // re-roll the whole poster: a new seed (field + palette + crop) AND fresh
-    // values for every tunable control, within tasteful bands.
     const r2 = (n: number) => Math.round(n * 100) / 100;
     const r3 = (n: number) => Math.round(n * 1000) / 1000;
     setParams((p) =>
@@ -244,77 +210,147 @@ export function App() {
         ? {
             ...p,
             seed: (Math.random() * 4294967296) >>> 0,
-            zoom: r2(1 + Math.random() * 2), // 1–3
-            contourGap: r3(0.06 + Math.random() * 0.14), // 0.06–0.20
-            lineWeight: r2(0.8 + Math.random() * 1.0), // 0.8–1.8
-            dotScale: r2(0.6 + Math.random() * 1.1), // 0.6–1.7
-            negativeSpace: r2(0.2 + Math.random() * 0.4), // 0.2–0.6
-            grain: r2(0.18 + Math.random() * 0.22) // 0.18–0.40
+            zoom: r2(1 + Math.random() * 2),
+            contourGap: r3(0.06 + Math.random() * 0.14),
+            lineWeight: r2(0.8 + Math.random() * 1.0),
+            dotScale: r2(0.6 + Math.random() * 1.1),
+            negativeSpace: r2(0.2 + Math.random() * 0.4),
+            grain: r2(0.18 + Math.random() * 0.22)
           }
         : p
     );
   }
 
-  function reset() {
-    setPhase({ kind: "idle" });
-    setParams(null);
-    setEditorOpen(false);
-    window.history.replaceState(null, "", window.location.pathname);
+  // fetch whenever the repo (slug) changes
+  useEffect(() => {
+    if (!owner || !name) return;
+    const token = ++runToken.current;
+    setModel(null);
+    setError(null);
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/repo?owner=${encodeURIComponent(owner)}&name=${encodeURIComponent(name)}`
+        );
+        const data = await res.json();
+        if (runToken.current !== token) return;
+        if (!res.ok || data.error) {
+          // viral / rate-limit: show a friendly, user-facing message (the raw
+          // server message is owner-oriented — "add a GITHUB_TOKEN").
+          const msg =
+            data.kind === "rate_limit" || res.status === 429
+              ? "Repostr is under heavy load right now — GitHub's rate limit is maxed. Give it a few minutes and try again."
+              : (data.error ?? `Couldn't load this repo (${res.status}).`);
+          setError(msg);
+          return;
+        }
+        const m = analyze(data.repo as RawRepo);
+        const sp = new URLSearchParams(window.location.search);
+        setModel(m);
+        setParams([...sp.keys()].length ? paramsFromQuery(m, sp) : defaultParams(m));
+        const top = m.palette[0];
+        void recordPoster({
+          slug: m.slug,
+          owner: m.owner,
+          name: m.name,
+          language: top?.name ?? "",
+          languageColor: top?.color ?? "#8a8a8a",
+          volatility: m.volatility
+        });
+      } catch {
+        if (runToken.current === token) setError("Network error reaching the server.");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  // warm the OG share image for the CURRENT view (keyed by its full param-set),
+  // debounced so dragging sliders doesn't spam renders. Each distinct variant
+  // gets its own cached image, so different shuffles unfurl differently.
+  useEffect(() => {
+    if (!model || !params) return;
+    const key = paramsQuery(model, params); // repo=slug[&param=…]
+    if (ogDone.current.has(key)) return;
+    const id = window.setTimeout(() => {
+      ogDone.current.add(key);
+      try {
+        const b64 = renderOgDataUrl(model, params).split(",")[1] ?? "";
+        if (b64) void fetch(`/og?${key}`, { method: "POST", body: b64 });
+      } catch {
+        /* OG is best-effort */
+      }
+    }, 1100);
+    return () => window.clearTimeout(id);
+  }, [model, params]);
+
+  // live render, coalesced to one paint per frame
+  useEffect(() => {
+    if (!model || !params || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => renderPoster(canvas, model, params));
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [model, params, edit]);
+
+  // mirror the render params into the query string (the path stays /owner/repo)
+  useEffect(() => {
+    if (!model || !params) return;
+    const sp = new URLSearchParams(paramsQuery(model, params));
+    sp.delete("repo");
+    const qs = sp.toString();
+    const path = `/${owner}/${name}${edit ? "/edit" : ""}`;
+    window.history.replaceState(null, "", qs ? `${path}?${qs}` : path);
+  }, [model, params, edit, owner, name]);
+
+  if (error) {
+    return (
+      <section className="flex min-h-screen flex-col items-center justify-center gap-4 px-6 text-center">
+        <div className="font-mono text-sm text-white">{slug}</div>
+        <p className="max-w-sm font-mono text-xs text-[#e06b5a]">{error}</p>
+        <Btn variant="accent" icon="back" onClick={() => navigate("/")}>
+          back
+        </Btn>
+      </section>
+    );
   }
+  if (!model || !params) return <Loading slug={slug} />;
 
+  const search = loc.search || "";
   return (
-    <main className="min-h-screen bg-[#0c0c0c] font-mono text-[#cfcfcf]">
-      {(phase.kind === "idle" || phase.kind === "error") && (
-        <>
-          <Hero
-            input={input}
-            setInput={setInput}
-            onPaint={() => void paint(input)}
-            onPick={(s) => void paint(s)}
-            error={phase.kind === "error" ? phase.message : undefined}
-          />
-          <Gallery rows={gallery} onPick={(s) => void paint(s)} />
-        </>
-      )}
-
-      {phase.kind === "loading" && <Loading slug={phase.slug} message={phase.message} />}
-
-      {phase.kind === "done" && params && !editorOpen && (
+    <>
+      {!edit && (
         <ResultView
           canvasRef={canvasRef}
-          model={phase.model}
+          model={model}
           params={params}
           onShuffle={shuffle}
-          onEdit={() => setEditorOpen(true)}
-          onReset={reset}
+          onEdit={() => navigate(`/${owner}/${name}/edit${search}`)}
+          onReset={() => navigate("/")}
           onShare={() => setShareOpen(true)}
         />
       )}
-
-      {phase.kind === "done" && params && editorOpen && (
+      {edit && (
         <Editor
           canvasRef={canvasRef}
-          model={phase.model}
+          model={model}
           params={params}
           set={set}
           onShuffle={shuffle}
-          onClose={() => setEditorOpen(false)}
-          onReset={reset}
+          onClose={() => navigate(`/${owner}/${name}${search}`)}
+          onReset={() => navigate("/")}
           onShare={() => setShareOpen(true)}
         />
       )}
-
-      {shareOpen && phase.kind === "done" && params && (
+      {shareOpen && (
         <ShareModal
-          model={phase.model}
+          model={model}
           params={params}
-          onCopy={() => copy(phase.model, params)}
+          onCopy={() => copy(model, params)}
           onClose={() => setShareOpen(false)}
         />
       )}
-
       {toast && <Toast>{toast}</Toast>}
-    </main>
+    </>
   );
 }
 
@@ -334,7 +370,7 @@ function Hero({
   error?: string;
 }) {
   return (
-    <section className="mx-auto flex max-w-2xl flex-col items-center px-6 pb-16 pt-[16vh] text-center">
+    <section className="mx-auto flex max-w-2xl flex-col items-center px-6 pb-16 pt-[clamp(2rem,10vw,8rem)] text-center">
       <h1 className="font-sans text-6xl font-bold tracking-tight text-white sm:text-7xl">Repostr</h1>
       <h2 className="mt-3 font-mono text-[13px] text-[#8f8f8f]">Git history as print</h2>
       <p className="mt-6 max-w-md text-sm leading-relaxed text-[#8f8f8f]">
@@ -390,84 +426,110 @@ function Hero({
   );
 }
 
-function Loading({ slug, message }: { slug: string; message: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
+// on-brand rotating status lines (cartography / git / print themed)
+const LOADING_PHRASES = [
+  "reading the commit history",
+  "surveying the terrain",
+  "tracing the contours",
+  "measuring the churn",
+  "plotting the releases",
+  "charting the timeline",
+  "finding the dead zones",
+  "counting the rewrites",
+  "triangulating the flow",
+  "mixing the inks",
+  "warming up the press",
+  "developing the print"
+];
 
+function Loading({ slug }: { slug: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const [phrase, setPhrase] = useState(0);
+
+  useEffect(() => {
+    const id = window.setInterval(
+      () => setPhrase((p) => (p + 1) % LOADING_PHRASES.length),
+      1500
+    );
+    return () => clearInterval(id);
+  }, []);
+
+  // a living mini-poster: animated topographic iso-contours, same language as
+  // the finished print, so the wait previews the result.
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    const W = 520;
-    const H = 680;
+    const W = 360;
+    const H = 480;
     canvas.width = W;
     canvas.height = H;
-
-    // one gravity well the flow converges toward
-    const well = { x: W * 0.74, y: H * 0.5 };
-    const N = 42; // flow lines
-    // slowly drifting curl field
-    const curl = (x: number, y: number, t: number) =>
-      Math.sin(y * 0.012 + t * 0.5) + 0.6 * Math.cos((x - y) * 0.006 + t * 0.4);
-
+    const cell = 9;
+    const cols = Math.ceil(W / cell);
+    const rows = Math.ceil(H / cell);
+    const field = (x: number, y: number, t: number) => {
+      const nx = x / W;
+      const ny = y / H;
+      return (
+        Math.sin(nx * 6.0 + t) * 0.6 +
+        Math.cos(ny * 5.0 - t * 0.8) * 0.5 +
+        Math.sin((nx + ny) * 4.2 + t * 0.55) * 0.42 +
+        Math.cos((nx - ny) * 7.5 - t * 0.4) * 0.3
+      );
+    };
+    const levels: number[] = [];
+    for (let l = -1.5; l <= 1.5; l += 0.18) levels.push(l);
+    const seg: Record<number, number[]> = {
+      1: [3, 2], 2: [2, 1], 3: [3, 1], 4: [0, 1], 6: [0, 2], 7: [0, 3],
+      8: [0, 3], 9: [0, 2], 11: [0, 1], 12: [3, 1], 13: [2, 1], 14: [3, 2]
+    };
+    const pt = (e: number, x: number, y: number, tl: number, tr: number, br: number, bl: number, lv: number): [number, number] => {
+      const f = (a: number, b: number) => {
+        const d = b - a;
+        return Math.abs(d) < 1e-9 ? 0.5 : (lv - a) / d;
+      };
+      if (e === 0) return [x + cell * f(tl, tr), y];
+      if (e === 1) return [x + cell, y + cell * f(tr, br)];
+      if (e === 2) return [x + cell * f(bl, br), y + cell];
+      return [x, y + cell * f(tl, bl)];
+    };
     let raf = 0;
     const t0 = performance.now();
     const frame = (now: number) => {
-      const t = (now - t0) / 1000;
-      ctx.clearRect(0, 0, W, H);
-      ctx.lineCap = "round";
-
-      // a soft highlight that travels left -> right along the flow ("reading")
-      const sweep = ((t * 0.16) % 1.3) * W - 40;
-
-      for (let i = 0; i < N; i++) {
-        const f = i / (N - 1);
-        let px = -10;
-        let py = H * 0.12 + f * H * 0.76;
-        let ang = 0;
-        const pts: Array<[number, number]> = [[px, py]];
-        for (let s = 0; s < 60 && px < W + 10; s++) {
-          ang += curl(px, py, t) * 0.045;
-          // converge toward the well
-          const dx = well.x - px;
-          const dy = well.y - py;
-          const d = Math.hypot(dx, dy) || 1;
-          if (d < 320) {
-            let diff = Math.atan2(dy, dx) - ang;
-            while (diff > Math.PI) diff -= Math.PI * 2;
-            while (diff < -Math.PI) diff += Math.PI * 2;
-            ang += diff * (1 - d / 320) * 0.16;
-          }
-          px += Math.cos(ang) * 11;
-          py += Math.sin(ang) * 11;
-          pts.push([px, py]);
-        }
-        // brightness bumps where the sweep passes
-        const mid = pts[Math.floor(pts.length / 2)] ?? [0, 0];
-        const near = 1 - Math.min(1, Math.abs(mid[0] - sweep) / 120);
-        ctx.strokeStyle = `rgba(255,255,255,${(0.1 + near * 0.36).toFixed(3)})`;
-        ctx.lineWidth = 0.7 + near * 0.9;
+      const t = ((now - t0) / 1000) * 0.55;
+      ctx.fillStyle = "#efece3";
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = "rgba(26,24,20,0.5)";
+      ctx.lineWidth = 1;
+      const vals: number[][] = [];
+      for (let j = 0; j <= rows; j++) {
+        vals[j] = [];
+        for (let i = 0; i <= cols; i++) vals[j][i] = field(i * cell, j * cell, t);
+      }
+      for (const lv of levels) {
         ctx.beginPath();
-        ctx.moveTo(pts[0][0], pts[0][1]);
-        for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+        for (let j = 0; j < rows; j++)
+          for (let i = 0; i < cols; i++) {
+            const x = i * cell, y = j * cell;
+            const tl = vals[j][i], tr = vals[j][i + 1], br = vals[j + 1][i + 1], bl = vals[j + 1][i];
+            let idx = 0;
+            if (tl > lv) idx |= 8;
+            if (tr > lv) idx |= 4;
+            if (br > lv) idx |= 2;
+            if (bl > lv) idx |= 1;
+            const dr = (a: number, b: number) => {
+              const p0 = pt(a, x, y, tl, tr, br, bl, lv);
+              const p1 = pt(b, x, y, tl, tr, br, bl, lv);
+              ctx.moveTo(p0[0], p0[1]);
+              ctx.lineTo(p1[0], p1[1]);
+            };
+            if (idx === 5) { dr(0, 3); dr(2, 1); }
+            else if (idx === 10) { dr(0, 1); dr(3, 2); }
+            else if (seg[idx]) dr(seg[idx][0], seg[idx][1]);
+          }
         ctx.stroke();
       }
-
-      // breathing gravity ring + crosshair at the convergence point
-      const r = 16 + Math.sin(t * 1.8) * 5;
-      ctx.strokeStyle = "rgba(255,255,255,0.55)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(well.x, well.y, r, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(well.x - 8, well.y);
-      ctx.lineTo(well.x + 8, well.y);
-      ctx.moveTo(well.x, well.y - 8);
-      ctx.lineTo(well.x, well.y + 8);
-      ctx.stroke();
-
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -475,13 +537,17 @@ function Loading({ slug, message }: { slug: string; message: string }) {
   }, []);
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center gap-5">
-      <canvas ref={ref} className="w-[min(300px,72vw)] opacity-90" style={{ aspectRatio: "520 / 680" }} />
-      <div className="flex flex-col items-center gap-1">
+    <div className="flex min-h-screen flex-col items-center justify-center gap-6 px-6">
+      <div
+        className="rpr-pop w-[min(300px,72vw)] bg-[#efece3] p-2 shadow-[0_40px_90px_-40px_rgba(0,0,0,0.9)] ring-1 ring-black/50"
+        style={{ aspectRatio: "3 / 4" }}
+      >
+        <canvas ref={ref} className="block h-full w-full" />
+      </div>
+      <div className="flex flex-col items-center gap-1.5">
         <div className="font-mono text-sm text-white">{slug}</div>
-        <div className="font-mono text-[12px] text-[#6f6f6f]">
-          {message}
-          <span className="ml-1 inline-block animate-pulse">●</span>
+        <div className="font-mono text-[12px] text-[#7f7f7f]">
+          <span key={phrase} className="rpr-fade inline-block">{LOADING_PHRASES[phrase]}…</span>
         </div>
       </div>
     </div>
@@ -519,7 +585,7 @@ function ResultView({
         <Btn icon="download" onClick={() => downloadPoster(model, params)}>download</Btn>
         <Btn icon="share" onClick={onShare}>share</Btn>
         <span className="mx-1 h-5 w-px bg-[#262626]" aria-hidden />
-        <Btn variant="accent" icon="sparkles" onClick={onReset}>new</Btn>
+        <Btn variant="accent" icon="plus" onClick={onReset}>new poster</Btn>
       </div>
 
       <p className="rpr-rise rpr-d2 mt-5 text-center font-mono text-[11px] text-[#6f6f6f]">
@@ -578,7 +644,7 @@ function Editor({
           <Btn icon="download" onClick={() => downloadPoster(model, params)}>download</Btn>
           <Btn icon="share" onClick={onShare}>share</Btn>
           <span className="mx-0.5 hidden h-5 w-px bg-[#262626] sm:block" aria-hidden />
-          <Btn variant="accent" icon="sparkles" onClick={onReset}>new</Btn>
+          <Btn variant="accent" icon="plus" onClick={onReset}>new poster</Btn>
         </div>
       </header>
 
@@ -858,6 +924,7 @@ type IconName =
   | "check"
   | "close"
   | "back"
+  | "plus"
   | "wand";
 
 // Authentic Hugeicons "stroke-rounded" path data (free set, v4.2.1).
@@ -903,6 +970,12 @@ const ICON_PATHS: Record<IconName, any> = {
   check: <path d="M5 14L8.5 17.5L19 6.5" />,
   close: <path d="M18 6L6.00081 17.9992M17.9992 18L6 6.00085" />,
   back: <path d="M15 6C15 6 9.00001 10.4189 9 12C8.99999 13.5812 15 18 15 18" />,
+  plus: (
+    <>
+      <path d="M12 5V19" />
+      <path d="M5 12H19" />
+    </>
+  ),
   wand: (
     <>
       <path d="M13.9258 12.7775L11.7775 10.6292C11.4847 10.3364 11.3383 10.19 11.1803 10.1117C10.8798 9.96277 10.527 9.96277 10.2264 10.1117C10.0685 10.19 9.92207 10.3364 9.62923 10.6292C9.33638 10.9221 9.18996 11.0685 9.11169 11.2264C8.96277 11.527 8.96277 11.8798 9.11169 12.1803C9.18996 12.3383 9.33638 12.4847 9.62923 12.7775L11.7775 14.9258M13.9258 12.7775L20.3708 19.2225C20.6636 19.5153 20.81 19.6617 20.8883 19.8197C21.0372 20.1202 21.0372 20.473 20.8883 20.7736C20.81 20.9315 20.6636 21.0779 20.3708 21.3708C20.0779 21.6636 19.9315 21.81 19.7736 21.8883C19.473 22.0372 19.1202 22.0372 18.8197 21.8883C18.6617 21.81 18.5153 21.6636 18.2225 21.3708L11.7775 14.9258" />
@@ -1003,7 +1076,7 @@ function Gallery({ rows, onPick }: { rows?: PosterRow[]; onPick: (slug: string) 
               style={{ backgroundColor: `${row.languageColor}1f` }}
             >
               <img
-                src={`og?repo=${encodeURIComponent(row.slug)}`}
+                src={`/og?repo=${encodeURIComponent(row.slug)}`}
                 alt={`${row.owner}/${row.name} poster`}
                 loading="lazy"
                 decoding="async"

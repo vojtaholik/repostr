@@ -132,11 +132,13 @@ export default capsule({
       }
     }),
 
-    // GET /og?repo=owner/name -> the cached share card as a JPEG (real bytes).
-    // Falls back to a branded SVG until a client has warmed the cache.
+    // GET /og?repo=owner/name&<render params> -> the cached share card (JPEG).
+    // Keyed by the FULL param-set, so every shuffle/edit has its own image (not
+    // just one per repo). Falls back to a branded SVG until a client warms it.
     og: endpoint({ method: "GET", path: "/og" }, (ctx, req) => {
       const slug = (req.query.get("repo") ?? "").trim().toLowerCase();
-      const hit = slug ? ctx.db.ogimages.where("slug", slug).all()[0] : undefined;
+      const key = ogKey(req.query);
+      const hit = key ? ctx.db.ogimages.where("slug", key).all()[0] : undefined;
       if (hit && hit.png) {
         return binaryResponse(base64ToBytes(hit.png), "image/jpeg", "public, max-age=86400");
       }
@@ -153,8 +155,9 @@ export default capsule({
     // image upload is reliable and verifiable.
     ogUpload: endpoint({ method: "POST", path: "/og" }, async (ctx, req) => {
       const slug = (req.query.get("repo") ?? "").trim().toLowerCase();
+      const key = ogKey(req.query); // keyed by the full param-set, like GET
       const body = (await req.text()).replace(/^data:image\/\w+;base64,/, "");
-      if (!slug || !slug.includes("/") || !body) {
+      if (!slug || !slug.includes("/") || !key || !body) {
         return json({ ok: false }, { status: 400 });
       }
       // string() columns cap at 64KB. The client downscales the OG JPEG to fit,
@@ -163,10 +166,10 @@ export default capsule({
       if (utf8Bytes(body) > MAX_VALUE_BYTES) {
         return json({ ok: false, error: "too_large", bytes: body.length }, { status: 413 });
       }
-      for (const row of ctx.db.ogimages.where("slug", slug).all()) {
+      for (const row of ctx.db.ogimages.where("slug", key).all()) {
         ctx.db.ogimages.delete(row.id);
       }
-      ctx.db.ogimages.insert({ slug, png: body });
+      ctx.db.ogimages.insert({ slug: key, png: body });
       return json({ ok: true, bytes: body.length });
     }),
 
@@ -186,8 +189,10 @@ export default capsule({
       }
 
       let title = slug || "Repostr";
+      // Branded, descriptive copy — NOT the repo's own GitHub tagline (which is
+      // off-topic for the poster). Describes what the image actually is.
       let desc =
-        "A generative poster painted from a repository's git history — bursts, dead zones, rewrites and releases.";
+        "A generative topographic poster mapped from a GitHub repository's git history — its commit timeline, churn and releases rendered as terrain.";
       const cached = slug ? ctx.db.repos.where("slug", slug).all()[0] : undefined;
       if (cached) {
         try {
@@ -197,21 +202,33 @@ export default capsule({
             description?: string;
             stars?: number;
             languages?: Record<string, number>;
+            weeks?: unknown[];
+            tags?: unknown[];
           };
           if (p.owner && p.name) title = `${p.owner}/${p.name}`;
           const top = topLanguage(p.languages);
           const stars = typeof p.stars === "number" ? `${formatStars(p.stars)}★` : "";
-          const bits = [top, stars].filter(Boolean).join(" · ");
-          desc = p.description
-            ? p.description
-            : `${title}${bits ? ` — ${bits}` : ""} — git history as print.`;
+          const weeks = Array.isArray(p.weeks) ? p.weeks.length : 0;
+          const rels = Array.isArray(p.tags) ? p.tags.length : 0;
+          const bits = [top, stars, weeks ? `${weeks} weeks` : "", rels ? `${rels} releases` : ""]
+            .filter(Boolean)
+            .join(" · ");
+          desc = `${title} — its git history mapped as a generative topographic print${bits ? `. ${bits}` : ""}.`;
         } catch {
           // keep defaults
         }
       }
 
-      const img = `${origin}/og?repo=${encodeURIComponent(slug)}`;
-      const appUrl = `${origin}/?${req.query.toString()}`;
+      // include the full param-set so the unfurl image matches the exact view
+      const img = `${origin}/og?${req.query.toString()}`;
+      // redirect humans to the real client route /owner/repo?<render params>
+      // (the app now uses path-based routing, not ?repo=).
+      const appParams = new URLSearchParams(req.query.toString());
+      appParams.delete("repo");
+      const appQs = appParams.toString();
+      const appUrl = slug.includes("/")
+        ? `${origin}/${slug}${appQs ? `?${appQs}` : ""}`
+        : `${origin}/`;
       const pageUrl = `${origin}/share?${req.query.toString()}`;
       const t = `${title} — Repostr`;
       const alt = `${title} — git history painted as a generative poster`;
@@ -329,6 +346,17 @@ function binaryResponse(
     headers: { "Content-Type": contentType, "Cache-Control": cacheControl },
     body: bytes
   } as unknown as ReturnType<typeof text>;
+}
+
+// Canonical cache key for an OG variant: every query param (repo + render
+// params) sorted, so the same view always maps to the same key regardless of
+// param order. paramsQuery omits defaults, so the default view keys to just
+// "repo=slug" (what the gallery thumbnails request).
+function ogKey(q: { forEach: (cb: (v: string, k: string) => void) => void }): string {
+  const parts: string[] = [];
+  q.forEach((v, k) => parts.push(`${k}=${v}`));
+  parts.sort();
+  return parts.join("&");
 }
 
 function escapeHtml(s: string): string {
